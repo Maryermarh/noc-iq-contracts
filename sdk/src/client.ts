@@ -98,6 +98,11 @@ export interface RpcResponse {
   error?: string;
   /** Numeric contract error code (`Error(Contract, #N)`), when the failure came from the contract. */
   contractErrorCode?: number;
+  /**
+   * Set by the transport when an error response carried a body that could not be parsed
+   * (for example invalid JSON), so it can be told apart from an empty body.
+   */
+  malformedBody?: boolean;
 }
 
 export type Transport = (request: RpcRequest, signal?: AbortSignalLike) => Promise<RpcResponse>;
@@ -113,6 +118,12 @@ const DEFAULT_RETRY: RetryPolicy = { maxAttempts: 3, baseDelayMs: 250 };
 
 /** Stable, machine-readable code placed on {@link ContractResult.errorCode}. */
 export const CANCELLED_ERROR_CODE = "CANCELLED";
+
+/** `errorCode` for a 4xx/5xx response (or error flag) that carried no error body at all (issue #1068). */
+export const EMPTY_ERROR_RESPONSE_CODE = "EMPTY_ERROR_RESPONSE";
+
+/** `errorCode` for an error response whose body could not be parsed (issue #1068). */
+export const MALFORMED_RESPONSE_ERROR_CODE = "MALFORMED_RESPONSE";
 
 /**
  * Generic contract invocation result wrapper.
@@ -133,6 +144,8 @@ export interface ContractResult<T> {
   contractErrorCode?: number;
   /** True only when the request was aborted by the caller. Aborted requests are never retried. */
   cancelled?: boolean;
+  /** HTTP-style status of the failed response (present on failures that came from a response). */
+  status?: number;
 }
 
 /**
@@ -1010,7 +1023,7 @@ function delay(ms: number, signal?: AbortSignalLike): Promise<boolean> {
 }
 
 function toResult<T>(response: RpcResponse): ContractResult<T> {
-  if (response.status < 400 && response.error === undefined) {
+  if (response.status < 400 && response.error === undefined && !response.malformedBody) {
     return { ok: true, value: response.value as T };
   }
   if (response.contractErrorCode !== undefined) {
@@ -1020,9 +1033,28 @@ function toResult<T>(response: RpcResponse): ContractResult<T> {
       error: decoded.message,
       errorCode: decoded.name,
       contractErrorCode: decoded.code,
+      status: response.status,
     };
   }
-  return { ok: false, error: response.error ?? `Request failed with status ${response.status}` };
+  // A body that could not be parsed is reported as such, never as an empty body or a contract error.
+  if (response.malformedBody) {
+    return {
+      ok: false,
+      error: `Malformed error response body (status ${response.status})`,
+      errorCode: MALFORMED_RESPONSE_ERROR_CODE,
+      status: response.status,
+    };
+  }
+  // An error status with no (or a blank) message: surface a stable, status-bearing transport error.
+  if (response.error === undefined || response.error.trim() === "") {
+    return {
+      ok: false,
+      error: `Empty error response (status ${response.status})`,
+      errorCode: EMPTY_ERROR_RESPONSE_CODE,
+      status: response.status,
+    };
+  }
+  return { ok: false, error: response.error, status: response.status };
 }
 
 /**

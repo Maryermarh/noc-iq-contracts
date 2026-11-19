@@ -83,10 +83,10 @@ jobs:
           fi
           echo "Generated bindings are current."
 
-      # #1050 — the module map must list every exported contract method
-      - name: Verify the module map lists every contract entrypoint
+      # #1055 — every SLAError variant must have an off-chain catalog entry
+      - name: Verify error catalog covers every contract error code
         working-directory: sdk
-        run: npx ts-node --transpile-only ../scripts/check-module-map.ts
+        run: npx ts-node --transpile-only ../scripts/check-error-catalog.ts
 
   # #1092 — decide whether deployment helper scripts changed
   changes:

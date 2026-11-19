@@ -20,6 +20,16 @@ export interface PayoutIntent {
   finality: FinalityState;
   ledger_sequence?: number; // set when finalized
   tx_hash?: string;
+  /** Audited corrections applied to a finalized intent (see {@link recoverFinalized}). */
+  recovery_audit?: RecoveryAudit[];
+}
+
+export interface RecoveryAudit {
+  reason: string;
+  actor: string;
+  recorded_at: number; // unix ms
+  /** Finality state that was undone. */
+  from: FinalityState;
 }
 
 /** Allowed finality state transitions. */
@@ -42,6 +52,54 @@ export function transition(
     );
   }
   return { ...intent, finality: next };
+}
+
+export interface ReconcileResult {
+  intent: PayoutIntent;
+  applied: boolean;
+  /** Why an observation was not applied. */
+  reason?: string;
+}
+
+/**
+ * Reconciles a later observation of the payout with the stored intent. A late `pending` or
+ * `submitted` observation can never move a finalized payout backward: it is ignored and the
+ * intent is returned unchanged. Any other observation must be a legal transition.
+ */
+export function reconcileObservation(intent: PayoutIntent, observed: FinalityState): ReconcileResult {
+  if (observed === intent.finality) {
+    return { intent, applied: false, reason: "already in this state" };
+  }
+  if (intent.finality === "finalized") {
+    return {
+      intent,
+      applied: false,
+      reason: `finalized payout ignores late ${observed} observation; use recoverFinalized for an audited correction`,
+    };
+  }
+  if (!TRANSITIONS[intent.finality].includes(observed)) {
+    return { intent, applied: false, reason: `illegal transition ${intent.finality} -> ${observed}` };
+  }
+  return { intent: transition(intent, observed), applied: true };
+}
+
+/**
+ * The only way back out of `finalized`: an explicit, audited recovery (for example after a
+ * chain reorganization). It records who did it and why, and requeues the intent as `pending`.
+ */
+export function recoverFinalized(intent: PayoutIntent, audit: Omit<RecoveryAudit, "from">): PayoutIntent {
+  if (intent.finality !== "finalized") {
+    throw new Error(`[SC-W5-113] recoverFinalized requires a finalized intent, got ${intent.finality} for ${intent.outage_id}`);
+  }
+  if (!audit.reason.trim() || !audit.actor.trim()) {
+    throw new Error(`[SC-W5-113] recovery of ${intent.outage_id} requires a non-empty reason and actor`);
+  }
+  const { ledger_sequence: _ledger, tx_hash: _hash, ...rest } = intent;
+  return {
+    ...rest,
+    finality: "pending",
+    recovery_audit: [...(intent.recovery_audit ?? []), { ...audit, from: "finalized" }],
+  };
 }
 
 function runTests(): void {
@@ -88,6 +146,49 @@ function runTests(): void {
     if (!e.message.includes("SC-W5-113")) throw e;
     console.log("  ✓ adversarial: pending -> finalized (skip) rejected");
   }
+
+  // Late observations never move a finalized payout backward.
+  const done: PayoutIntent = { ...finalized, ledger_sequence: 100, tx_hash: "TX" };
+  for (const late of ["pending", "submitted", "rolled_back", "expired"] as FinalityState[]) {
+    const r = reconcileObservation(done, late);
+    if (r.applied || r.intent !== done) throw new Error(`Late ${late} observation must not change a finalized payout`);
+  }
+  console.log("  ✓ late pending/submitted/rolled_back/expired observations ignored after finality");
+
+  const same = reconcileObservation(done, "finalized");
+  if (same.applied) throw new Error("Re-observing finalized must be a no-op");
+  console.log("  ✓ re-observing finalized is a no-op");
+
+  const legal = reconcileObservation(base, "submitted");
+  if (!legal.applied || legal.intent.finality !== "submitted") throw new Error("Legal observation should apply");
+  const illegal = reconcileObservation(base, "finalized");
+  if (illegal.applied || illegal.intent.finality !== "pending") throw new Error("Illegal observation must not apply");
+  console.log("  ✓ legal observations apply, illegal ones are rejected without changing state");
+
+  // The only way out of finality is the audited recovery path.
+  const recovered = recoverFinalized(done, { reason: "ledger reorg", actor: "ops@noc", recorded_at: 1 });
+  if (recovered.finality !== "pending" || recovered.tx_hash !== undefined || recovered.ledger_sequence !== undefined)
+    throw new Error("Recovery should requeue as pending and clear chain references");
+  if (recovered.recovery_audit?.length !== 1 || recovered.recovery_audit[0]!.from !== "finalized")
+    throw new Error("Recovery must leave an audit record");
+  if (done.finality !== "finalized") throw new Error("Recovery must not mutate the original intent");
+  console.log("  ✓ recoverFinalized requeues with an audit record and leaves the original untouched");
+
+  for (const bad of [{ reason: "", actor: "a" }, { reason: "r", actor: " " }]) {
+    try {
+      recoverFinalized(done, { ...bad, recorded_at: 1 });
+      throw new Error("Should have thrown");
+    } catch (e: any) {
+      if (!e.message.includes("SC-W5-113")) throw e;
+    }
+  }
+  try {
+    recoverFinalized(base, { reason: "r", actor: "a", recorded_at: 1 });
+    throw new Error("Should have thrown");
+  } catch (e: any) {
+    if (!e.message.includes("SC-W5-113")) throw e;
+  }
+  console.log("  ✓ adversarial: recovery needs a reason, an actor and a finalized intent");
 
   console.log("\nAll finality-state annotation tests passed.");
 }

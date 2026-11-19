@@ -249,7 +249,12 @@ describe("scval conversions", () => {
   });
 });
 
-import { CANCELLED_ERROR_CODE, RpcResponse } from "../src/client";
+import {
+  CANCELLED_ERROR_CODE,
+  EMPTY_ERROR_RESPONSE_CODE,
+  MALFORMED_RESPONSE_ERROR_CODE,
+  RpcResponse,
+} from "../src/client";
 import { CursorValidationError, MAX_CURSOR_LENGTH, decodeHistoryRequest, encodeHistoryRequest } from "../src/cursor";
 
 function clientWith(transport: (req: any, signal?: any) => Promise<RpcResponse>, retry = { maxAttempts: 3, baseDelayMs: 1 }) {
@@ -409,5 +414,68 @@ describe("history cursor validation (issue #1070)", () => {
     await clientWith(transport).getHistoryPageByCursor({ cursor: goodCursor, limit: 5 });
 
     expect(transport.mock.calls[0][0]).toMatchObject({ method: "get_history_page_cursor" });
+  });
+});
+
+describe("empty and malformed error responses (issue #1068)", () => {
+  it.each([400, 404, 500, 502])("an empty %i response maps to a status-bearing transport error", async (status) => {
+    const transport = vi.fn(async (): Promise<RpcResponse> => ({ status }));
+
+    const result = await clientWith(transport, { maxAttempts: 1, baseDelayMs: 1 }).getAdmin();
+
+    expect(result).toMatchObject({ ok: false, errorCode: EMPTY_ERROR_RESPONSE_CODE, status });
+    expect(result.error).toContain(String(status));
+    expect(result.contractErrorCode).toBeUndefined();
+  });
+
+  it("treats a blank error string like an empty body", async () => {
+    const transport = vi.fn(async (): Promise<RpcResponse> => ({ status: 400, error: "   " }));
+
+    const result = await clientWith(transport).getAdmin();
+
+    expect(result).toMatchObject({ ok: false, errorCode: EMPTY_ERROR_RESPONSE_CODE, status: 400 });
+  });
+
+  it("an exhausted retry on an empty 5xx reports the transport error with the status", async () => {
+    const transport = vi.fn(async (): Promise<RpcResponse> => ({ status: 503 }));
+
+    const result = await clientWith(transport, { maxAttempts: 2, baseDelayMs: 1 }).getAdmin();
+
+    expect(result).toMatchObject({ ok: false, errorCode: EMPTY_ERROR_RESPONSE_CODE, status: 503 });
+    expect(transport).toHaveBeenCalledTimes(2);
+  });
+
+  it("a malformed body is reported separately from an empty one", async () => {
+    const transport = vi.fn(async (): Promise<RpcResponse> => ({ status: 400, malformedBody: true }));
+
+    const result = await clientWith(transport).getAdmin();
+
+    expect(result).toMatchObject({ ok: false, errorCode: MALFORMED_RESPONSE_ERROR_CODE, status: 400 });
+    expect(result.errorCode).not.toBe(EMPTY_ERROR_RESPONSE_CODE);
+  });
+
+  it("a valid contract error envelope keeps its contract error code", async () => {
+    const transport = vi.fn(async (): Promise<RpcResponse> => ({ status: 400, error: "x", contractErrorCode: 3 }));
+
+    const result = await clientWith(transport).pause("G", "r");
+
+    expect(result).toMatchObject({ ok: false, errorCode: "Unauthorized", contractErrorCode: 3, status: 400 });
+  });
+
+  it("a plain error message is passed through with its status", async () => {
+    const transport = vi.fn(async (): Promise<RpcResponse> => ({ status: 400, error: "bad request" }));
+
+    const result = await clientWith(transport).getAdmin();
+
+    expect(result).toMatchObject({ ok: false, error: "bad request", status: 400 });
+    expect(result.errorCode).toBeUndefined();
+  });
+
+  it("successful responses carry no status or error code", async () => {
+    const transport = vi.fn(async (): Promise<RpcResponse> => ({ status: 200, value: "GADMIN" }));
+
+    const result = await clientWith(transport).getAdmin();
+
+    expect(result).toEqual({ ok: true, value: "GADMIN" });
   });
 });

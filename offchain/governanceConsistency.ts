@@ -29,6 +29,93 @@ interface VersionInfo {
   contract_name: string;
 }
 
+// ---------------------------------------------------------------------------
+// #1060: pending-admin reconciliation
+// ---------------------------------------------------------------------------
+
+/** Authoritative state read from the contract (`get_admin` / `get_pending_admin`). */
+export interface AdminSnapshot {
+  admin?: string | null;
+  pendingAdmin?: string | null;
+}
+
+/** Off-chain state projected from events. It can lag the contract and is never authoritative. */
+export interface AdminProjection {
+  admin?: string | null;
+  pendingAdmin?: string | null;
+  /** Ledger of the last event folded into the projection, for diagnostics. */
+  lastEventLedger?: number;
+}
+
+export type DriftKind =
+  | "stale_pending_admin"      // projection shows a pending admin the contract no longer has
+  | "missing_pending_admin"    // contract has a pending admin the projection has not seen
+  | "superseded_pending_admin" // both have one, but the contract's was replaced
+  | "stale_admin";             // projected admin differs from the contract's
+
+export interface AdminDrift {
+  kind: DriftKind;
+  field: "admin" | "pendingAdmin";
+  projected: string | null;
+  actual: string | null;
+}
+
+export interface AdminReconciliation {
+  /** The contract's pending admin: the only value callers may act on. */
+  authoritativePendingAdmin: string | null;
+  authoritativeAdmin: string | null;
+  consistent: boolean;
+  drift: AdminDrift[];
+}
+
+const norm = (v: string | null | undefined): string | null => (v === undefined || v === null || v === "" ? null : v);
+
+/**
+ * Reconciles an event projection against the current contract snapshot. The snapshot always wins;
+ * any difference is reported as drift instead of being merged in.
+ */
+export function reconcileAdminState(snapshot: AdminSnapshot, projection: AdminProjection): AdminReconciliation {
+  const actualAdmin = norm(snapshot.admin);
+  const actualPending = norm(snapshot.pendingAdmin);
+  const projAdmin = norm(projection.admin);
+  const projPending = norm(projection.pendingAdmin);
+  const drift: AdminDrift[] = [];
+
+  if (projPending !== actualPending) {
+    const kind: DriftKind =
+      projPending !== null && actualPending === null ? "stale_pending_admin"
+      : projPending === null ? "missing_pending_admin"
+      : "superseded_pending_admin";
+    drift.push({ kind, field: "pendingAdmin", projected: projPending, actual: actualPending });
+  }
+  if (projAdmin !== null && projAdmin !== actualAdmin) {
+    drift.push({ kind: "stale_admin", field: "admin", projected: projAdmin, actual: actualAdmin });
+  }
+  return {
+    authoritativePendingAdmin: actualPending,
+    authoritativeAdmin: actualAdmin,
+    consistent: drift.length === 0,
+    drift,
+  };
+}
+
+function assertReconciliation(
+  label: string,
+  snapshot: AdminSnapshot,
+  projection: AdminProjection,
+  expectDrift: DriftKind[],
+  expectPending: string | null
+): void {
+  const r = reconcileAdminState(snapshot, projection);
+  const kinds = r.drift.map((d) => d.kind);
+  if (JSON.stringify(kinds) !== JSON.stringify(expectDrift))
+    throw new Error(`[#1060] ${label}: drift ${JSON.stringify(kinds)}, expected ${JSON.stringify(expectDrift)}`);
+  if (r.authoritativePendingAdmin !== expectPending)
+    throw new Error(`[#1060] ${label}: authoritative pending admin ${r.authoritativePendingAdmin}, expected ${expectPending}`);
+  if (r.consistent !== (expectDrift.length === 0)) throw new Error(`[#1060] ${label}: consistent flag mismatch`);
+  console.log(`  ✓ ${label}`);
+}
+
 function assertConsistency(
   event: GovernanceEvent,
   state: ContractState,
@@ -99,5 +186,15 @@ versionScenarios.forEach(({ label, info }) => {
   assertVersionInfo(info);
   console.log(`  ✓ ${label}: consistent`);
 });
+
+console.log("[#1060] Pending-admin reconciliation checks:");
+assertReconciliation("matching snapshot and projection reconcile", { admin: "GOLD", pendingAdmin: "GNEW" }, { admin: "GOLD", pendingAdmin: "GNEW" }, [], "GNEW");
+assertReconciliation("no pending admin on either side is consistent", { admin: "GOLD" }, { admin: "GOLD", pendingAdmin: null }, [], null);
+assertReconciliation("a pending admin the contract already superseded (accepted) is stale drift", { admin: "GNEW", pendingAdmin: null }, { admin: "GNEW", pendingAdmin: "GNEW" }, ["stale_pending_admin"], null);
+assertReconciliation("a cancelled proposal still shown by the projection is stale drift", { admin: "GOLD" }, { admin: "GOLD", pendingAdmin: "GNEW" }, ["stale_pending_admin"], null);
+assertReconciliation("a replaced proposal is reported as superseded", { admin: "GOLD", pendingAdmin: "GNEWER" }, { admin: "GOLD", pendingAdmin: "GNEW" }, ["superseded_pending_admin"], "GNEWER");
+assertReconciliation("a proposal the projection missed is reported", { admin: "GOLD", pendingAdmin: "GNEW" }, { admin: "GOLD" }, ["missing_pending_admin"], "GNEW");
+assertReconciliation("a stale admin is reported alongside stale pending admin", { admin: "GNEW" }, { admin: "GOLD", pendingAdmin: "GNEW" }, ["stale_pending_admin", "stale_admin"], null);
+assertReconciliation("empty string is treated as absent", { admin: "GOLD", pendingAdmin: "" }, { admin: "GOLD", pendingAdmin: undefined }, [], null);
 
 console.log("All consistency checks passed.");
