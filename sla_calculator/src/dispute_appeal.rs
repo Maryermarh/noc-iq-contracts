@@ -10,6 +10,8 @@ pub enum AppealError {
     AlreadyAppealed = 2,
     MaxAppealsReached = 3,
     InvalidMaxAppeals = 4,
+    /// #1035 — the settlement payout is final and cannot be reopened.
+    PayoutFinal = 5,
 }
 
 const FORTY_EIGHT_HOURS_SECS: u64 = 48 * 60 * 60;
@@ -40,6 +42,46 @@ pub fn file_appeal(
     let required_bond = original_bond * 2;
     env.events().publish((APPEAL_FILED_EVENT,), dispute_id);
     Ok(required_bond)
+}
+
+/// #1035 — file an appeal only while the dispute is still in the allowed
+/// pre-settlement window. A terminal payout rejects the appeal without
+/// changing the payout record or emitting an appeal event.
+pub fn file_appeal_guarded(
+    env: &Env,
+    appellant: &Address,
+    dispute_id: u64,
+    settled_at: u64,
+    already_appealed: bool,
+    original_bond: i128,
+    payout_released: bool,
+) -> Result<i128, AppealError> {
+    if payout_released {
+        return Err(AppealError::PayoutFinal);
+    }
+    if already_appealed {
+        return Err(AppealError::AlreadyAppealed);
+    }
+    if env.ledger().timestamp() > settled_at + FORTY_EIGHT_HOURS_SECS {
+        return Err(AppealError::WindowExpired);
+    }
+    appellant.require_auth();
+    Ok(original_bond * 2)
+}
+
+/// Whether an appeal is still permissible for the given payout state.
+pub fn appeal_permitted(
+    env: &Env,
+    settled_at: u64,
+    payout_released: bool,
+) -> Result<(), AppealError> {
+    if payout_released {
+        return Err(AppealError::PayoutFinal);
+    }
+    if env.ledger().timestamp() > settled_at + FORTY_EIGHT_HOURS_SECS {
+        return Err(AppealError::WindowExpired);
+    }
+    Ok(())
 }
 
 /// Returns the number of appeals consumed by a dispute.
@@ -124,6 +166,54 @@ mod tests {
             );
             assert_eq!(set_max_appeals(&env, &admin, 3), Ok(()));
             assert_eq!(max_appeals(&env), 3);
+        });
+    }
+}
+
+#[cfg(test)]
+mod terminal_payout_tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
+
+    const PAYOUT_KEY: Symbol = symbol_short!("PAYREC");
+
+    #[test]
+    fn a_terminal_payout_rejects_the_appeal_without_touching_the_record() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+        let contract = env.register_contract(None, crate::SLACalculatorContract);
+        let appellant = Address::generate(&env);
+
+        env.as_contract(&contract, || {
+            env.storage().persistent().set(&PAYOUT_KEY, &500i128);
+
+            let result = file_appeal_guarded(&env, &appellant, 7, 900, false, 250, true);
+            assert_eq!(result, Err(AppealError::PayoutFinal));
+
+            assert_eq!(
+                env.storage().persistent().get::<_, i128>(&PAYOUT_KEY),
+                Some(500)
+            );
+            assert_eq!(appeal_count(&env, 7), 0);
+            assert_eq!(env.events().all().len(), 0);
+        });
+    }
+
+    #[test]
+    fn an_appeal_in_the_allowed_window_is_accepted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+        let contract = env.register_contract(None, crate::SLACalculatorContract);
+        let appellant = Address::generate(&env);
+
+        env.as_contract(&contract, || {
+            assert_eq!(
+                file_appeal_guarded(&env, &appellant, 7, 900, false, 250, false),
+                Ok(500)
+            );
+            assert_eq!(appeal_permitted(&env, 900, false), Ok(()));
         });
     }
 }

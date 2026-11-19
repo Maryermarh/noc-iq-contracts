@@ -140,6 +140,10 @@ pub fn perform_upgrade(env: &Env, caller: &Address) -> Result<(), SLAError> {
         return Err(SLAError::VersionMismatch);
     }
 
+    // #1032 — snapshot operational safety state before any migration step so
+    // an open breaker keeps its cooldown and next-probe ledger afterwards.
+    let breaker_before = crate::circuit_breaker::circuit_state(env);
+
     let from_version = stored;
     let mut current = stored;
 
@@ -171,6 +175,10 @@ pub fn perform_upgrade(env: &Env, caller: &Address) -> Result<(), SLAError> {
         .unwrap_or_else(|| soroban_sdk::Vec::new(env));
     log.push_back(record);
     env.storage().instance().set(&UPGRADE_LOG_KEY, &log);
+
+    // #1032 — restore the breaker exactly as it was; a closed breaker stays
+    // closed and an open breaker does not lose its cooldown.
+    crate::circuit_breaker::restore_state(env, &breaker_before);
 
     env.events().publish(
         (EVENT_UPGRADED, EVENT_VERSION, caller),
@@ -565,6 +573,51 @@ mod tests {
             setup(&env, &admin);
             let result = cancel_key_rotation(&env, &not_admin);
             assert_eq!(result, Err(KeyRotationError::NotAdmin));
+        });
+    }
+}
+
+#[cfg(test)]
+mod breaker_upgrade_tests {
+    use super::*;
+    use crate::circuit_breaker::{circuit_state, open_circuit, probe_allowed};
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn an_open_breaker_keeps_its_cooldown_across_upgrade() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, crate::SLACalculatorContract);
+        let admin = Address::generate(&env);
+        let guard = Address::generate(&env);
+
+        env.as_contract(&cid, || {
+            env.storage().instance().set(&ADMIN_KEY, &admin);
+            env.storage().instance().set(&STORAGE_VERSION_KEY, &0u32);
+            open_circuit(&env, &guard, 1_000, 500);
+            assert_eq!(perform_upgrade(&env, &admin), Ok(()));
+
+            let state = circuit_state(&env);
+            assert!(state.open);
+            assert_eq!(state.next_probe_ledger, 1_500);
+            assert_eq!(state.cooldown_ledgers, 500);
+            assert!(!probe_allowed(&state, 1_000));
+            assert!(probe_allowed(&state, 1_500));
+        });
+    }
+
+    #[test]
+    fn a_closed_breaker_stays_closed_across_upgrade() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, crate::SLACalculatorContract);
+        let admin = Address::generate(&env);
+
+        env.as_contract(&cid, || {
+            env.storage().instance().set(&ADMIN_KEY, &admin);
+            env.storage().instance().set(&STORAGE_VERSION_KEY, &0u32);
+            assert_eq!(perform_upgrade(&env, &admin), Ok(()));
+            assert!(!circuit_state(&env).open);
         });
     }
 }
