@@ -22,6 +22,13 @@ fi
 
 echo "=== WASM Size Profile (top ${TOP_N} functions by Rust source) ==="
 echo ""
+# #1025 — record the toolchain and protocol alongside every profile so a
+# report from a different toolchain is recognisable as incomparable.
+echo "Profile metadata:"
+echo "  rust:      $(rustc --version 2>/dev/null || echo 'unknown')"
+echo "  soroban:   SDK 21.0.0 / protocol 21"
+echo "  generated: $(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo 'unknown')"
+echo ""
 
 cargo bloat \
   --target wasm32-unknown-unknown \

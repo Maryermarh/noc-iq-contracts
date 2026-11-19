@@ -193,6 +193,13 @@ pub fn set_max_index_size(env: &Env, max_size: u32) {
     env.storage().instance().set(&MAX_INDEX_SIZE_KEY, &max_size);
 }
 
+/// #1026 — retention rule shared with compaction: an entry whose timestamp
+/// is exactly on the cutoff is kept, so the correlation references pointing
+/// at that event remain queryable after compaction.
+pub fn keep_index_entry_at_boundary(recorded_at: u64, cutoff: u64) -> bool {
+    recorded_at >= cutoff
+}
+
 /// Remove index entries recorded before `cutoff`; returns how many were pruned.
 pub fn prune_index_before(env: &Env, cutoff: u64) -> Result<u32, SLAError> {
     let index = get_event_index(env)?;
@@ -200,7 +207,7 @@ pub fn prune_index_before(env: &Env, cutoff: u64) -> Result<u32, SLAError> {
 
     for i in 0..index.entries.len() {
         let entry = index.entries.get(i).unwrap();
-        if entry.recorded_at >= cutoff {
+        if keep_index_entry_at_boundary(entry.recorded_at, cutoff) {
             kept.push_back(entry);
         }
     }
@@ -279,5 +286,17 @@ mod tests {
             assert_eq!(pruned.entries.get(0).unwrap().position, 1);
             assert_eq!(pruned.entries.get(1).unwrap().position, 2);
         });
+    }
+}
+
+#[cfg(test)]
+mod boundary_reference_tests {
+    use super::*;
+
+    #[test]
+    fn the_cutoff_entry_is_kept_so_its_reference_remains_queryable() {
+        assert!(!keep_index_entry_at_boundary(19, 20));
+        assert!(keep_index_entry_at_boundary(20, 20));
+        assert!(keep_index_entry_at_boundary(21, 20));
     }
 }
