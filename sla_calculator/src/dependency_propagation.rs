@@ -5,6 +5,8 @@ pub const PARENT_INDEX: Symbol = symbol_short!("dp_idx");
 pub const CHILD_INDEX: Symbol = symbol_short!("dc_idx");
 pub const MANUAL_STATUS: Symbol = symbol_short!("d_stat");
 pub const AUTO_DEGRADED: Symbol = symbol_short!("d_auto");
+/// #1020 — root causes that have already emitted a pause transition.
+pub const CAUSE_TRANSITION_KEY: Symbol = symbol_short!("d_cause");
 
 pub const STATUS_OPERATIONAL: u32 = 0;
 pub const STATUS_DEGRADED: u32 = 1;
@@ -135,6 +137,29 @@ pub fn site_status(env: &Env, site: &Symbol) -> u32 {
 }
 
 pub fn propagate_outage(env: &Env, parent: &Symbol) -> u32 {
+    propagate_outage_for_cause(env, parent, parent)
+}
+
+/// #1020 — propagate a failure attributed to `cause`.
+///
+/// Only the first propagation of a given root cause may change state and
+/// emit a pause transition. Repeating it is a no-op, while a *different*
+/// cause still degrades the site and leaves its own visible status/event.
+pub fn propagate_outage_for_cause(env: &Env, parent: &Symbol, cause: &Symbol) -> u32 {
+    let mut seen: soroban_sdk::Map<Symbol, bool> = env
+        .storage()
+        .persistent()
+        .get(&CAUSE_TRANSITION_KEY)
+        .unwrap_or(soroban_sdk::Map::new(env));
+
+    if seen.get(cause.clone()).unwrap_or(false) {
+        return 0;
+    }
+    seen.set(cause.clone(), true);
+    env.storage()
+        .persistent()
+        .set(&CAUSE_TRANSITION_KEY, &seen);
+
     let mut flagged = 0u32;
     for child in children_of(env, parent).iter() {
         if manual_status(env, &child) == STATUS_DOWN {
@@ -143,6 +168,9 @@ pub fn propagate_outage(env: &Env, parent: &Symbol) -> u32 {
         set_auto_flag(env, &child, true);
         flagged += 1;
     }
+    // Exactly one transition event per root cause, regardless of how many
+    // layers the failure travelled through.
+    env.events().publish((DEPENDENCY_EVENT, cause.clone()), parent.clone());
     flagged
 }
 
@@ -294,6 +322,59 @@ mod tests {
             register_dependency(&env, &core, &edge_a).expect("a");
             register_dependency(&env, &core, &edge_b).expect("b");
             assert_eq!(propagate_outage(&env, &core), 2);
+        });
+    }
+}
+
+#[cfg(test)]
+mod cause_dedup_tests {
+    use super::*;
+    use soroban_sdk::{testutils::Events as _, Address as _};
+
+    fn contract(env: &Env) -> soroban_sdk::Address {
+        env.register_contract(None, SLACalculatorContract)
+    }
+
+    #[test]
+    fn repeated_propagation_for_one_cause_changes_state_once() {
+        let env = Env::default();
+        env.as_contract(&contract(&env), || {
+            let core = Symbol::new(&env, "core");
+            let edge = Symbol::new(&env, "edge");
+            let cause = Symbol::new(&env, "provider_down");
+            register_dependency(&env, &core, &edge).unwrap();
+
+            assert_eq!(propagate_outage_for_cause(&env, &core, &cause), 1);
+            assert_eq!(propagate_outage_for_cause(&env, &core, &cause), 0);
+            assert_eq!(propagate_outage_for_cause(&env, &core, &cause), 0);
+            assert_eq!(env.events().all().len(), 1);
+            assert_eq!(site_status(&env, &edge), STATUS_DEGRADED);
+        });
+    }
+
+    #[test]
+    fn a_distinct_cause_stays_visible() {
+        let env = Env::default();
+        env.as_contract(&contract(&env), || {
+            let core = Symbol::new(&env, "core");
+            let edge = Symbol::new(&env, "edge");
+            let first = Symbol::new(&env, "provider_down");
+            let second = Symbol::new(&env, "dns_down");
+            register_dependency(&env, &core, &edge).unwrap();
+
+            assert_eq!(propagate_outage_for_cause(&env, &core, &first), 1);
+            assert_eq!(propagate_outage_for_cause(&env, &core, &second), 1);
+
+            // A distinct cause gets its own transition, and both causes
+            // remain distinguishable in storage.
+            let seen: soroban_sdk::Map<Symbol, bool> = env
+                .storage()
+                .persistent()
+                .get(&CAUSE_TRANSITION_KEY)
+                .unwrap();
+            assert_eq!(seen.get(first).unwrap(), true);
+            assert_eq!(seen.get(second).unwrap(), true);
+            assert_eq!(env.events().all().len(), 2);
         });
     }
 }

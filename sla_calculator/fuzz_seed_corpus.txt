@@ -1,0 +1,28 @@
+# Checked-in seed corpus for the SLA calculator fuzz harness (#1022).
+#
+# Format (one seed per line): <mttr_minutes>,<severity>
+#
+# Each line is a minimized input that previously exercised a boundary in the
+# calculation path. The harness in sla_calculator/src/fuzz_tests.rs imports
+# this file at compile time and reports the exact seed on failure, so a new
+# minimized crash input can be added here without touching production code.
+0,critical
+1,high
+5,medium
+14,low
+15,critical
+16,high
+30,medium
+59,low
+60,critical
+119,high
+120,medium
+240,low
+479,critical
+480,high
+999,medium
+1000,low
+1439,critical
+1440,high
+1441,medium
+10000,low

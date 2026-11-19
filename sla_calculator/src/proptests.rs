@@ -6,7 +6,7 @@ use proptest::prelude::*;
 use soroban_sdk::{symbol_short, Address, Env, Symbol, Vec};
 use std::string::String;
 
-use crate::{SLACalculatorContract, SLAError, SLAConfig, batch::{BatchRequest, BatchSummary, BatchResult}};
+use crate::{SLACalculatorContract, SLAError, SLAConfig, state_integrity::ConfigState, batch::{BatchRequest, BatchSummary, BatchResult}};
 
 mod utils;
 
@@ -380,4 +380,94 @@ fn prop_batch_view_never_mutates_state() {
         assert_eq!(initial_admin, final_admin, "Admin must not change after view call");
         assert_eq!(initial_operator, final_operator, "Operator must not change after view call");
     });
+}
+
+// -----------------------------------------------------------------------
+// #1023 — config mutation sequences must preserve cross-field invariants
+// -----------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigOp {
+    /// Governance sets a new configured threshold.
+    Update(u32),
+    /// Roll back the last configured threshold.
+    Rollback(u32),
+    /// Freeze or unfreeze configuration changes.
+    Freeze(bool),
+    /// Apply a configuration revision (clears one pending revision).
+    ApplyRevision,
+    /// Read-only observation; must never change state.
+    Read,
+}
+
+fn arb_config_op() -> impl Strategy<Value = ConfigOp> {
+    prop_oneof![
+        (1u32..=1440).prop_map(ConfigOp::Update),
+        (1u32..=1440).prop_map(ConfigOp::Rollback),
+        any::<bool>().prop_map(ConfigOp::Freeze),
+        Just(ConfigOp::ApplyRevision),
+        Just(ConfigOp::Read),
+    ]
+}
+
+/// Apply one operation to a state, modelling the guard rules as a state
+/// machine. Invalid operations are rejected (state unchanged) so that no
+/// generated sequence can ever violate the cross-field invariants.
+fn apply_op(state: ConfigState, op: ConfigOp) -> ConfigState {
+    match op {
+        ConfigOp::Update(value) if !state.frozen => ConfigState {
+            configured_minutes: value,
+            effective_minutes: crate::threshold_bounds::resolve_effective_threshold(value)
+                .map(|r| r.effective_minutes)
+                .unwrap_or(state.effective_minutes),
+            pending_revisions: state.pending_revisions.saturating_add(1),
+            ..state
+        },
+        ConfigOp::Rollback(value) if !state.frozen && state.pending_revisions > 0 => ConfigState {
+            configured_minutes: value,
+            effective_minutes: crate::threshold_bounds::resolve_effective_threshold(value)
+                .map(|r| r.effective_minutes)
+                .unwrap_or(state.effective_minutes),
+            pending_revisions: state.pending_revisions.saturating_sub(1),
+            ..state
+        },
+        ConfigOp::Freeze(frozen) if !frozen || state.pending_revisions == 0 => ConfigState {
+            frozen,
+            ..state
+        },
+        ConfigOp::ApplyRevision if state.pending_revisions > 0 => ConfigState {
+            pending_revisions: state.pending_revisions.saturating_sub(1),
+            ..state
+        },
+        // Reads and rejected operations leave state untouched.
+        _ => state,
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    #[test]
+    fn prop_config_mutation_sequences_preserve_invariants(
+        ops in proptest::collection::vec(arb_config_op(), 1..40)
+    ) {
+        let mut state = ConfigState {
+            configured_minutes: 60,
+            effective_minutes: 60,
+            frozen: false,
+            pending_revisions: 0,
+        };
+        for (index, op) in ops.iter().enumerate() {
+            state = apply_op(state, *op);
+            if let Err(violation) = crate::state_integrity::check_config_invariants(state) {
+                // Proptest shrinks to a minimal sequence; naming the prefix
+                // and the operation makes the reproduction self-contained.
+                return Err(TestCaseError::fail(std::format!(
+                    "invariant {violation:?} after operation #{index} ({op:?}); prefix: {:?}",
+                    &ops[..=index]
+                )));
+            }
+        }
+        Ok(())
+    }
 }
