@@ -88,6 +88,10 @@ jobs:
         working-directory: sdk
         run: npx ts-node --transpile-only ../scripts/check-error-catalog.ts
 
+      # #1022 — replay the checked-in fuzz seed corpus and report failing seeds
+      - name: Replay checked-in fuzz seed corpus
+        run: cargo test -p sla_calculator replay_seed_corpus -- --nocapture
+
   # #1092 — decide whether deployment helper scripts changed
   changes:
     name: Detect deployment script changes
