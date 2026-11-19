@@ -83,6 +83,11 @@ jobs:
           fi
           echo "Generated bindings are current."
 
+      # #1050 — the module map must list every exported contract method
+      - name: Verify the module map lists every contract entrypoint
+        working-directory: sdk
+        run: npx ts-node --transpile-only ../scripts/check-module-map.ts
+
   # #1092 — decide whether deployment helper scripts changed
   changes:
     name: Detect deployment script changes

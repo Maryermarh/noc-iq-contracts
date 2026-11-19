@@ -68,6 +68,104 @@ export function reconcile(
   };
 }
 
+// ---------------------------------------------------------------------------
+// #1052: submitted-but-unconfirmed is not the same as rejected
+// ---------------------------------------------------------------------------
+
+/** What the backend currently knows about a submission, with unconfirmed kept apart from rejected. */
+export type ReplayOutcome =
+  | "finalized"             // a lookup found the transaction applied
+  | "rejected"              // definitively not applied: refused before submission, or failed on chain
+  | "submitted_unconfirmed" // the network accepted it (or a lookup found nothing yet); it may still land
+  | "unknown";              // the submit call itself was ambiguous (timeout, dropped connection)
+
+export interface ReplayObservation {
+  outage_id: string;
+  /** What the submit call returned. */
+  submit_result: "accepted" | "rejected" | "timeout" | "connection_lost";
+  /** The result of a transaction lookup, once one has been done. */
+  lookup?: "confirmed" | "failed" | "not_found";
+}
+
+export interface ReplayDecision {
+  outage_id: string;
+  outcome: ReplayOutcome;
+  /** A lookup by transaction hash is still required before any resubmission decision. */
+  requires_lookup: boolean;
+  /** Only true for outcomes that are definitively not applied. */
+  may_resubmit: boolean;
+  reason: string;
+}
+
+/**
+ * Decides what the replay tooling may do next. An outcome that is not definitively "rejected" or
+ * "finalized" never allows resubmission, and an ambiguous one requires a lookup first, so a
+ * timeout after submission is never treated as a safe-to-resubmit failure.
+ */
+export function decideReplay(obs: ReplayObservation): ReplayDecision {
+  const base = { outage_id: obs.outage_id };
+
+  if (obs.lookup === "confirmed") {
+    return { ...base, outcome: "finalized", requires_lookup: false, may_resubmit: false, reason: "lookup found the transaction applied" };
+  }
+  if (obs.lookup === "failed") {
+    return { ...base, outcome: "rejected", requires_lookup: false, may_resubmit: true, reason: "transaction failed on chain; it was not applied" };
+  }
+  if (obs.lookup === "not_found") {
+    return {
+      ...base,
+      outcome: "submitted_unconfirmed",
+      requires_lookup: false,
+      may_resubmit: false,
+      reason: "lookup found nothing yet; the transaction may still be included until its validity window closes",
+    };
+  }
+
+  // No lookup has been done yet.
+  switch (obs.submit_result) {
+    case "rejected":
+      return { ...base, outcome: "rejected", requires_lookup: false, may_resubmit: true, reason: "the network refused the submission; nothing was applied" };
+    case "accepted":
+      return { ...base, outcome: "submitted_unconfirmed", requires_lookup: true, may_resubmit: false, reason: "accepted but not yet confirmed; look it up before deciding" };
+    case "timeout":
+    case "connection_lost":
+      return { ...base, outcome: "unknown", requires_lookup: true, may_resubmit: false, reason: `${obs.submit_result}: the transaction may have landed; look it up before deciding` };
+  }
+}
+
+function runReplayDecisionTests(): void {
+  console.log("\n[#1052] Submitted-but-unconfirmed replay decision tests\n");
+
+  const cases: Array<[string, ReplayObservation, ReplayOutcome, boolean, boolean]> = [
+    // label, observation, outcome, requires_lookup, may_resubmit
+    ["refused submission is rejected and may be resubmitted", { outage_id: "O1", submit_result: "rejected" }, "rejected", false, true],
+    ["accepted but unconfirmed needs a lookup and is not rejected", { outage_id: "O2", submit_result: "accepted" }, "submitted_unconfirmed", true, false],
+    ["timeout is unknown, needs a lookup, not resubmittable", { outage_id: "O3", submit_result: "timeout" }, "unknown", true, false],
+    ["dropped connection is unknown, needs a lookup, not resubmittable", { outage_id: "O4", submit_result: "connection_lost" }, "unknown", true, false],
+    ["lookup confirmed is finalized", { outage_id: "O5", submit_result: "timeout", lookup: "confirmed" }, "finalized", false, false],
+    ["lookup failed is rejected and may be resubmitted", { outage_id: "O6", submit_result: "accepted", lookup: "failed" }, "rejected", false, true],
+    ["lookup found nothing stays unconfirmed, not resubmittable", { outage_id: "O7", submit_result: "timeout", lookup: "not_found" }, "submitted_unconfirmed", false, false],
+  ];
+  for (const [label, obs, outcome, requiresLookup, mayResubmit] of cases) {
+    const d = decideReplay(obs);
+    if (d.outcome !== outcome) throw new Error(`"${label}": outcome ${d.outcome}, expected ${outcome}`);
+    if (d.requires_lookup !== requiresLookup) throw new Error(`"${label}": requires_lookup mismatch`);
+    if (d.may_resubmit !== mayResubmit) throw new Error(`"${label}": may_resubmit mismatch`);
+    console.log(`  ✓ ${label}`);
+  }
+
+  // Adversarial: resubmission is only ever allowed for a definitive rejection, and never without a lookup first
+  // when the submit outcome was ambiguous.
+  for (const submit_result of ["accepted", "timeout", "connection_lost"] as const) {
+    const d = decideReplay({ outage_id: "OX", submit_result });
+    if (d.may_resubmit || !d.requires_lookup) throw new Error(`${submit_result} without a lookup must require one and forbid resubmission`);
+    if (d.outcome === "rejected") throw new Error(`${submit_result} must not be classified as rejected`);
+  }
+  console.log("  ✓ adversarial: no ambiguous outcome is ever rejected or resubmittable before a lookup");
+
+  console.log("\nAll replay decision tests passed.");
+}
+
 function runTests(): void {
   console.log("[SC-W5-114] Ambiguous outcome replay workflow tests\n");
 
@@ -100,3 +198,4 @@ function runTests(): void {
 }
 
 runTests();
+runReplayDecisionTests();
