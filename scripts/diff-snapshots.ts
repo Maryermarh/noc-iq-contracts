@@ -51,9 +51,58 @@ export function classifyDiff(before: JsonVal, after: JsonVal): DiffClassificatio
   return { semanticChanges, volatileChanges };
 }
 
+/** Expected snapshot names that are absent from `present`. */
+export function findMissingSnapshots(expected: string[], present: Set<string>): string[] {
+  return expected.filter((name) => !present.has(name)).sort();
+}
+
+/**
+ * Minimal line-based unified diff (single hunk with full context) so an
+ * intentional fixture update is reviewable. Returns "" when equal.
+ */
+export function unifiedDiff(before: string, after: string, labelA = "before", labelB = "after"): string {
+  if (before === after) return "";
+  const a = before.split("\n");
+  const b = after.split("\n");
+  // LCS table
+  const dp: number[][] = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0));
+  for (let i = a.length - 1; i >= 0; i--) {
+    for (let j = b.length - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const out: string[] = [`--- ${labelA}`, `+++ ${labelB}`, `@@ -1,${a.length} +1,${b.length} @@`];
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      out.push(` ${a[i]}`);
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      out.push(`-${a[i++]}`);
+    } else {
+      out.push(`+${b[j++]}`);
+    }
+  }
+  while (i < a.length) out.push(`-${a[i++]}`);
+  while (j < b.length) out.push(`+${b[j++]}`);
+  return out.join("\n") + "\n";
+}
+
 function classify(beforePath: string, afterPath: string): void {
-  const a = JSON.parse(fs.readFileSync(beforePath, "utf8"));
-  const b = JSON.parse(fs.readFileSync(afterPath, "utf8"));
+  const missing = [beforePath, afterPath].filter((f) => !fs.existsSync(f));
+  if (missing.length) {
+    console.error(`Missing snapshot(s):\n${missing.map((m) => `  - ${m}`).join("\n")}`);
+    console.error("A missing snapshot is not 'no difference'. Generate it, or pass the right path.");
+    process.exit(1);
+  }
+  const rawA = fs.readFileSync(beforePath, "utf8");
+  const rawB = fs.readFileSync(afterPath, "utf8");
+  const a = JSON.parse(rawA);
+  const b = JSON.parse(rawB);
+  const diffText = unifiedDiff(rawA, rawB, beforePath, afterPath);
+  if (diffText) console.log(diffText);
   const { semanticChanges, volatileChanges } = classifyDiff(a, b);
 
   for (const change of volatileChanges) {
@@ -77,6 +126,23 @@ function classify(beforePath: string, afterPath: string): void {
 
 if (require.main === module) {
   const [, , before, after] = process.argv;
+  if (before === "--require-dir") {
+    // --require-dir <dir> <name>... : every named snapshot must exist in <dir>
+    const dir = after;
+    const names = process.argv.slice(4);
+    if (!dir || names.length === 0) {
+      console.error("Usage: diff-snapshots.ts --require-dir <dir> <snapshot-name>...");
+      process.exit(1);
+    }
+    const present = new Set(fs.existsSync(dir) ? fs.readdirSync(dir) : []);
+    const missing = findMissingSnapshots(names, present);
+    if (missing.length) {
+      console.error(`Missing expected snapshots in ${dir}:\n${missing.map((m) => `  - ${m}`).join("\n")}`);
+      process.exit(1);
+    }
+    console.log(`All ${names.length} expected snapshot(s) present.`);
+    process.exit(0);
+  }
   if (!before || !after) {
     console.error("Usage: ts-node diff-snapshots.ts <before.json> <after.json>");
     process.exit(1);
