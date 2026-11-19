@@ -5,7 +5,14 @@
  * Provides ergonomic wrappers for all public contract methods.
  */
 
-export { SLACalculatorClient, TimeoutError, decodeContractEvent, CANCELLED_ERROR_CODE } from "./client";
+export {
+  SLACalculatorClient,
+  TimeoutError,
+  decodeContractEvent,
+  CANCELLED_ERROR_CODE,
+  EMPTY_ERROR_RESPONSE_CODE,
+  MALFORMED_RESPONSE_ERROR_CODE,
+} from "./client";
 export {
   CursorValidationError,
   MAX_CURSOR_LENGTH,

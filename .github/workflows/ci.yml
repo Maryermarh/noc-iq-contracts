@@ -83,10 +83,10 @@ jobs:
           fi
           echo "Generated bindings are current."
 
-      # #1042 — every exported contract method must be classified for the pause guard
-      - name: Verify the pause-guard inventory covers every contract entrypoint
+      # #1055 — every SLAError variant must have an off-chain catalog entry
+      - name: Verify error catalog covers every contract error code
         working-directory: sdk
-        run: npx ts-node --transpile-only ../scripts/check-pause-guard-inventory.ts
+        run: npx ts-node --transpile-only ../scripts/check-error-catalog.ts
 
   # #1092 — decide whether deployment helper scripts changed
   changes:

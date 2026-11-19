@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "limits": {
+    "sla_calculated": 200,
+    "contract_paused": 100,
+    "contract_unpaused": 80,
+    "admin_proposed": 120,
+    "operator_proposed": 120,
+    "version_info_read": 96
+  }
+}
