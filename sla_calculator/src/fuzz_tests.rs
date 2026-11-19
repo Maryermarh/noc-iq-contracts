@@ -2,7 +2,7 @@
 
 extern crate std;
 
-use soroban_sdk::{symbol_short, Address, Env};
+use soroban_sdk::{symbol_short, Address, Env, Symbol};
 use std::string::String;
 
 use crate::{SLACalculatorContract, SLAError};
@@ -223,4 +223,60 @@ fn fuzz_version_consistency() {
     let metadata = client.get_contract_metadata();
     assert_eq!(metadata.contract_name, symbol_short!("sla_calc"));
     assert_eq!(metadata.supported_severities.len(), 4);
+}
+
+/// #1022 — replay the checked-in seed corpus.
+///
+/// The corpus lives in `sla_calculator/fuzz_seed_corpus.txt` and is imported
+/// at compile time. A minimized crash input becomes a permanent regression
+/// fixture by adding one line to that file, with no production change. On a
+/// failure the exact seed is named in the panic message.
+#[test]
+fn replay_seed_corpus() {
+    const CORPUS: &str = include_str!("../fuzz_seed_corpus.txt");
+
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SLACalculatorContract);
+    let client = SLACalculatorContract::new_client(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let operator = Address::generate(&env);
+    client.initialize(&admin, &operator);
+
+    let mut replayed = 0usize;
+    for line in CORPUS.lines() {
+        let seed = line.trim();
+        if seed.is_empty() || seed.starts_with('#') {
+            continue;
+        }
+        replayed += 1;
+        let (mttr, severity) = seed.split_once(',').unwrap_or_else(|| {
+            panic!("invalid corpus seed {seed:?}: expected <mttr>,<severity>")
+        });
+        let mttr: u32 = mttr.parse().unwrap_or_else(|_| {
+            panic!("invalid corpus seed {seed:?}: mttr is not a u32")
+        });
+
+        let result = client.try_calculate_sla_view(
+            &symbol_short!("fuzz_seed"),
+            &Symbol::new(&env, severity),
+            &mttr,
+        );
+        match result {
+            Ok(value) => {
+                assert!(
+                    value.status == symbol_short!("met") || value.status == symbol_short!("viol"),
+                    "failing corpus seed {seed:?}: unexpected status {:?}",
+                    value.status
+                );
+                assert!(
+                    value.payment_type == symbol_short!("rew")
+                        || value.payment_type == symbol_short!("pen"),
+                    "failing corpus seed {seed:?}: unexpected payment type {:?}",
+                    value.payment_type
+                );
+            }
+            Err(error) => panic!("failing corpus seed {seed:?}: {error:?}"),
+        }
+    }
+    assert!(replayed > 0, "fuzz seed corpus must contain at least one seed");
 }

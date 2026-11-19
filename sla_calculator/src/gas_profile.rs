@@ -204,3 +204,72 @@ fn profile_history_pruning_cost() {
     // Profile: Prune to keep 25
     let _ = client.try_prune_history(&admin, &25);
 }
+
+// -----------------------------------------------------------------------
+// #1025 — toolchain/protocol metadata attached to every gas profile
+// -----------------------------------------------------------------------
+
+/// Soroban SDK version the contract is built against.
+pub const SOROBAN_SDK_VERSION: &str = "21.0.0";
+/// Soroban protocol version the measurements target.
+pub const SOROBAN_PROTOCOL_VERSION: u32 = 21;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolchainMetadata {
+    pub rust_version: String,
+    pub sdk_version: String,
+    pub protocol_version: u32,
+}
+
+/// A gas profile result together with the environment that produced it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GasProfileReport {
+    pub toolchain: ToolchainMetadata,
+    pub comparable_to_baseline: bool,
+}
+
+/// Capture the toolchain/protocol metadata for a profiling run.
+pub fn current_toolchain_metadata() -> ToolchainMetadata {
+    ToolchainMetadata {
+        rust_version: String::from(option_env!("RUSTC_VERSION").unwrap_or("unknown")),
+        sdk_version: String::from(SOROBAN_SDK_VERSION),
+        protocol_version: SOROBAN_PROTOCOL_VERSION,
+    }
+}
+
+/// Profiles are only comparable when produced by the same toolchain and
+/// protocol; a differing toolchain must be marked incomparable rather than
+/// silently replacing the stored baseline.
+pub fn profiles_are_comparable(a: &ToolchainMetadata, b: &ToolchainMetadata) -> bool {
+    a == b
+}
+
+/// Build a report and decide whether it can be compared to `baseline`.
+pub fn build_profile_report(baseline: &ToolchainMetadata) -> GasProfileReport {
+    let toolchain = current_toolchain_metadata();
+    GasProfileReport {
+        comparable_to_baseline: profiles_are_comparable(&toolchain, baseline),
+        toolchain,
+    }
+}
+
+#[cfg(test)]
+mod toolchain_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn a_report_records_sdk_and_protocol_versions() {
+        let report = build_profile_report(&current_toolchain_metadata());
+        assert_eq!(report.toolchain.sdk_version, SOROBAN_SDK_VERSION);
+        assert_eq!(report.toolchain.protocol_version, SOROBAN_PROTOCOL_VERSION);
+        assert!(report.comparable_to_baseline);
+    }
+
+    #[test]
+    fn a_different_toolchain_is_marked_incomparable() {
+        let mut baseline = current_toolchain_metadata();
+        baseline.rust_version = String::from("rustc 1.0.0 (different toolchain)");
+        let report = build_profile_report(&baseline);
+        assert!(!report.comparable_to_baseline);
+    }
+}

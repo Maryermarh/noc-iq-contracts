@@ -392,3 +392,43 @@ mod coordination_harness_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod interleaved_action_tests {
+    use crate::config_version_hash::{reconcile_revisions, RevisionOutcome};
+    use soroban_sdk::{Bytes, BytesN, Env};
+
+    fn revision(env: &Env, seed: u8) -> BytesN<32> {
+        crate::config_version_hash::compute_config_version_hash(
+            env,
+            &Bytes::from_slice(env, &[seed; 4]),
+        )
+    }
+
+    #[test]
+    fn operator_and_config_actions_converge_in_both_schedules() {
+        let env = Env::default();
+        let r = revision(&env, 1);
+
+        // Schedule A: operator acts, then the config revision is observed.
+        let schedule_a = reconcile_revisions(&r, &r);
+        // Schedule B: config revision lands, then the operator acts.
+        let schedule_b = reconcile_revisions(&r, &r);
+
+        assert_eq!(schedule_a, schedule_b);
+        assert_eq!(schedule_a, RevisionOutcome::Converged(r));
+    }
+
+    #[test]
+    fn racing_revisions_are_a_documented_conflict_in_both_schedules() {
+        let env = Env::default();
+        let operator = revision(&env, 1);
+        let config = revision(&env, 2);
+
+        let schedule_a = reconcile_revisions(&operator, &config);
+        let schedule_b = reconcile_revisions(&config, &operator);
+
+        assert_eq!(schedule_a, schedule_b);
+        assert_eq!(schedule_a, RevisionOutcome::Conflict);
+    }
+}

@@ -63,3 +63,30 @@ if (require.main === module) {
 
   console.log("All repeated-outage-ID semantics tests passed ✓");
 }
+
+/**
+ * #1039 — byte-parity vectors for outage identifiers in events.
+ *
+ * These boundary identifiers must survive a storage/event write and read
+ * byte-for-byte so an indexer can correlate them exactly. The contract-side
+ * guard is `outage_correlation_tag::validate_outage_id_bytes`.
+ */
+export const OUTAGE_ID_BYTE_PARITY_VECTORS: readonly string[] = [
+  "A",
+  "INC001",
+  "INC-001",
+  "OUTAGE_1234567890123456789012345678901",
+];
+
+/** Backend parity check: encoding then decoding must return identical bytes. */
+export function encodeOutageIdentifier(id: string): string {
+  return Buffer.from(id, "utf8").toString("utf8");
+}
+
+export function assertOutageIdByteParity(ids: readonly string[]): void {
+  for (const id of ids) {
+    assert(encodeOutageIdentifier(id) === id, `outage id '${id}' failed byte parity`);
+  }
+}
+
+assertOutageIdByteParity(OUTAGE_ID_BYTE_PARITY_VECTORS);

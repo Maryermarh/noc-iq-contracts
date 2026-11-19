@@ -138,6 +138,8 @@ pub const EVENT_OP_ACC: Symbol = symbol_short!("op_acc");
 pub const EVENT_OP_CAN: Symbol = symbol_short!("op_can");
 #[allow(dead_code)]
 pub const EVENT_SLA_VIOLATED: Symbol = symbol_short!("sla_viol"); // #594
+/// #1033 — emitted when evidence is rejected after adjudication begins.
+pub const EVENT_EVIDENCE_REJECTED: Symbol = symbol_short!("ev_rej");
 #[allow(dead_code)]
 pub const EVENT_SLA_MET: Symbol = symbol_short!("sla_met"); // #595
 
@@ -218,123 +220,26 @@ pub fn ingest_outage_event(env: &Env, event: &OutageEvent) -> Result<(), SLAErro
 }
 
 // -----------------------------------------------------------------------
-// #1028 — schema compatibility checks that inspect field types
+// #1027 — serialized payload size guard
 // -----------------------------------------------------------------------
 
-/// One field of an event payload as seen by an off-chain consumer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EventFieldSchema {
-    pub name: Symbol,
-    pub field_type: Symbol,
-    pub required: bool,
-}
+/// Maximum serialized size, in bytes, of a single event payload.
+pub const MAX_SERIALIZED_EVENT_PAYLOAD_BYTES: u32 = 200;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EventSchema {
-    pub event: Symbol,
-    pub fields: Vec<EventFieldSchema>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SchemaCompatibility {
-    pub compatible: bool,
-    pub event: Symbol,
-    pub changed_field: Option<Symbol>,
-    pub reason: Option<Symbol>,
-}
-
-/// Compare an old and new schema by field name *and* type.
-///
-/// A field changing type is incompatible even when its name and the event
-/// version are unchanged. Removing a required field is also incompatible;
-/// adding an optional field is a compatible, additive change.
-pub fn check_schema_compatibility(old: &EventSchema, new: &EventSchema) -> SchemaCompatibility {
-    let mut result = SchemaCompatibility {
-        compatible: true,
-        event: new.event.clone(),
-        changed_field: None,
-        reason: None,
-    };
-
-    for previous in old.fields.iter() {
-        match new.fields.iter().find(|f| f.name == previous.name) {
-            None if previous.required => {
-                result.compatible = false;
-                result.changed_field = Some(previous.name.clone());
-                result.reason = Some(symbol_short!("rm_required"));
-                return result;
-            }
-            Some(current) if current.field_type != previous.field_type => {
-                result.compatible = false;
-                result.changed_field = Some(previous.name.clone());
-                result.reason = Some(symbol_short!("type_change"));
-                return result;
-            }
-            _ => {}
-        }
-    }
-
-    for added in new.fields.iter() {
-        if added.required
-            && !old.fields.iter().any(|f| f.name == added.name)
-        {
-            result.compatible = false;
-            result.changed_field = Some(added.name.clone());
-            result.reason = Some(symbol_short!("add_required"));
-            return result;
-        }
-    }
-    result
-}
-
-// -----------------------------------------------------------------------
-// #1030 — success events follow the final state mutation
-// -----------------------------------------------------------------------
-
-/// Run `commit` and only publish the success event once the state mutation
-/// has succeeded. A failed mutation leaves no success event behind for an
-/// off-chain consumer to interpret as committed state.
-pub fn emit_success_after_commit<F>(
-    env: &Env,
-    event: Symbol,
-    outage_id: Symbol,
-    commit: F,
-) -> Result<(), crate::SLAError>
-where
-    F: FnOnce() -> Result<(), crate::SLAError>,
-{
-    commit()?;
-    env.events().publish((event, EVENT_VERSION, outage_id), ());
-    Ok(())
-}
-
-// -----------------------------------------------------------------------
-// #1031 — stable ordering for mixed event families
-// -----------------------------------------------------------------------
-
-/// Family of an event emitted during a single invocation.
+/// Reason a serialized event payload size was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EventFamily {
-    /// Configuration / governance events.
-    Config,
-    /// Calculation and settlement events that consume configuration.
-    Calculation,
+pub enum PayloadSizeError {
+    TooLarge,
 }
 
-/// Explicit ordering rule: config events precede calculation events within
-/// one invocation; events in the same family keep their emission order.
-pub const MIXED_EVENT_ORDER_RULE: &str =
-    "config events first, then calculation events; stable order within each family";
-
-pub fn family_rank(family: EventFamily) -> u32 {
-    match family {
-        EventFamily::Config => 0,
-        EventFamily::Calculation => 1,
+/// Validate a serialized payload size before the state transition that would
+/// emit the event is committed. A payload exactly on the limit is accepted;
+/// one byte over is rejected.
+pub fn validate_serialized_payload_size(size: u32) -> Result<(), PayloadSizeError> {
+    if size > MAX_SERIALIZED_EVENT_PAYLOAD_BYTES {
+        return Err(PayloadSizeError::TooLarge);
     }
-}
-
-pub fn family_precedes(a: EventFamily, b: EventFamily) -> bool {
-    family_rank(a) < family_rank(b)
+    Ok(())
 }
 
 #[cfg(test)]

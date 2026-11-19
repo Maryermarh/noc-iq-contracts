@@ -24,3 +24,19 @@ This baseline captures the initial contract posture for:
 ## Critical Path Cost Baseline
 - `calculate_sla` is treated as critical path.
 - Baseline tests should compare behavior across repeated runs and detect major regressions.
+
+## Cold and Warm Storage Baselines (#1024)
+- Storage cost reports label the **cold** (first-write) path separately from the
+  **warm** (steady-state read/write) paths; the two are never averaged together.
+- `StorageCostBaseline` in `sla_calculator/src/benchmarks.rs` carries the three
+  values, and `compare_storage_baseline` fails with a message naming the path
+  and both the measured and budgeted values when any path exceeds its budget.
+
+## Profile Toolchain Metadata (#1025)
+- Every gas profile records the Rust compiler version, the Soroban SDK version
+  (`21.0.0`) and the target protocol version (`21`).
+- `scripts/profile_wasm_bloat.sh` prints the same metadata at the top of each
+  run so reports saved from different sessions can be correlated.
+- A profile produced with a different toolchain is marked **incomparable** to
+  the stored baseline (`profiles_are_comparable` returns `false`); it must not
+  silently replace the baseline.

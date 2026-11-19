@@ -1,6 +1,6 @@
 #![allow(clippy::assign_op_pattern)]
 
-use soroban_sdk::{contracttype, symbol_short, Env, String, Symbol};
+use soroban_sdk::{contracttype, symbol_short, Env, Map, String, Symbol};
 
 pub const MAX_PAYLOAD_BYTES: u32 = 200;
 pub const MAX_DESCRIPTION_BYTES: u32 = 128;
@@ -113,6 +113,49 @@ pub fn emit_rejection(env: &Env, outage_id: Symbol, error: PayloadError) {
 pub fn emit_accepted(env: &Env, outage_id: Symbol, report: &PayloadReport) {
     env.events()
         .publish((PAYLOAD_OK, outage_id), report.total_bytes);
+}
+
+/// #1027 — storage key for byte sizes of accepted payloads, used as the
+/// index that rejection must never touch.
+const PAYLOAD_INDEX_KEY: Symbol = symbol_short!("ev_pidx");
+
+/// Validate the serialized size *before* writing state, then publish the
+/// acceptance event and update the index as one guarded operation.
+///
+/// A rejected payload produces no event and leaves the index untouched, so
+/// off-chain consumers can never observe a partially committed transition.
+pub fn emit_guarded(
+    env: &Env,
+    outage_id: Symbol,
+    description: &String,
+    metadata: &String,
+) -> Result<PayloadReport, PayloadError> {
+    let total = validate_payload(env, description, metadata)?;
+    crate::event_schema::validate_serialized_payload_size(total)
+        .map_err(|_| PayloadError::PayloadTooLarge)?;
+
+    let report = inspect(env, description, metadata);
+    env.events().publish((PAYLOAD_OK, outage_id.clone()), total);
+
+    let mut index: Map<Symbol, u32> = env
+        .storage()
+        .instance()
+        .get(&PAYLOAD_INDEX_KEY)
+        .unwrap_or(Map::new(env));
+    index.set(outage_id, total);
+    env.storage().instance().set(&PAYLOAD_INDEX_KEY, &index);
+
+    Ok(report)
+}
+
+/// Byte size recorded for `outage_id`, if an accepted payload was emitted.
+pub fn indexed_payload_size(env: &Env, outage_id: &Symbol) -> Option<u32> {
+    let index: Map<Symbol, u32> = env
+        .storage()
+        .instance()
+        .get(&PAYLOAD_INDEX_KEY)
+        .unwrap_or(Map::new(env));
+    index.get(outage_id.clone())
 }
 
 #[cfg(test)]
@@ -256,5 +299,55 @@ mod tests {
             validate_field_count(MAX_EVENT_FIELDS + 1),
             Err(PayloadError::TooManyFields)
         );
+    }
+}
+
+#[cfg(test)]
+mod guarded_emit_tests {
+    use super::*;
+    use soroban_sdk::testutils::Events as _;
+
+    fn repeat(env: &Env, byte: u8, times: u32) -> String {
+        let mut buf = [0u8; 512];
+        let total = times as usize;
+        assert!(total <= buf.len());
+        for slot in buf.iter_mut().take(total) {
+            *slot = byte;
+        }
+        String::from_bytes(env, &buf[..total])
+    }
+
+    #[test]
+    fn a_payload_on_the_limit_is_emitted_and_indexed() {
+        let env = Env::default();
+        let contract = env.register_contract(None, crate::SLACalculatorContract);
+        env.as_contract(&contract, || {
+            let outage = Symbol::new(&env, "OUT1");
+            let description = repeat(&env, "a", MAX_DESCRIPTION_BYTES);
+            let metadata = repeat(&env, "m", MAX_PAYLOAD_BYTES - MAX_DESCRIPTION_BYTES);
+
+            let report = emit_guarded(&env, outage.clone(), &description, &metadata).unwrap();
+            assert_eq!(report.total_bytes, MAX_PAYLOAD_BYTES);
+            assert_eq!(indexed_payload_size(&env, &outage), Some(MAX_PAYLOAD_BYTES));
+            assert_eq!(env.events().all().len(), 1);
+        });
+    }
+
+    #[test]
+    fn one_byte_over_the_limit_emits_nothing_and_does_not_update_the_index() {
+        let env = Env::default();
+        let contract = env.register_contract(None, crate::SLACalculatorContract);
+        env.as_contract(&contract, || {
+            let outage = Symbol::new(&env, "OUT1");
+            let description = repeat(&env, "a", MAX_DESCRIPTION_BYTES);
+            let metadata = repeat(&env, "m", MAX_PAYLOAD_BYTES - MAX_DESCRIPTION_BYTES + 1);
+
+            assert_eq!(
+                emit_guarded(&env, outage.clone(), &description, &metadata),
+                Err(PayloadError::PayloadTooLarge)
+            );
+            assert_eq!(indexed_payload_size(&env, &outage), None);
+            assert_eq!(env.events().all().len(), 0);
+        });
     }
 }
