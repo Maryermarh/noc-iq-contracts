@@ -165,7 +165,10 @@ pub fn remove_from_whitelist(
         return Ok(()); // Not in whitelist (idempotent)
     }
 
-    state.contracts.set(contract_address.clone(), false);
+    // #1018 — remove the key entirely instead of storing `false`, so a
+    // remove/re-add cycle leaves a single canonical entry and cannot change
+    // the map's key ordering.
+    state.contracts.remove(contract_address.clone());
     state.count = state.count.saturating_sub(1);
     env.storage().instance().set(&WHITELIST_KEY, &state);
 
@@ -843,6 +846,61 @@ mod idempotency_tests {
                 remove_from_whitelist(&env, &intruder, &target),
                 Err(SLAError::Unauthorized)
             );
+        });
+    }
+}
+
+#[cfg(test)]
+mod duplicate_addition_tests {
+    use super::*;
+    use soroban_sdk::{testutils::Events as _, Address as _, Env};
+
+    fn setup(env: &Env, admin: &Address) {
+        env.storage().instance().set(&ADMIN_KEY, admin);
+    }
+
+    #[test]
+    fn repeated_addition_emits_one_grant_event_and_keeps_one_entry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, crate::SLACalculatorContract);
+        let admin = Address::generate(&env);
+        let target = Address::generate(&env);
+
+        env.as_contract(&id, || {
+            setup(&env, &admin);
+            init_whitelist(&env);
+            add_to_whitelist(&env, &admin, &target).unwrap();
+            add_to_whitelist(&env, &admin, &target).unwrap();
+            add_to_whitelist(&env, &admin, &target).unwrap();
+
+            let (_, count) = get_whitelist_status(&env).unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(list_whitelisted(&env).unwrap().len(), 1);
+            assert_eq!(env.events().all().len(), 1);
+        });
+    }
+
+    #[test]
+    fn remove_then_readd_leaves_one_canonical_entry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, crate::SLACalculatorContract);
+        let admin = Address::generate(&env);
+        let target = Address::generate(&env);
+
+        env.as_contract(&id, || {
+            setup(&env, &admin);
+            init_whitelist(&env);
+            add_to_whitelist(&env, &admin, &target).unwrap();
+            remove_from_whitelist(&env, &admin, &target).unwrap();
+            add_to_whitelist(&env, &admin, &target).unwrap();
+
+            let state: WhitelistState = env.storage().instance().get(&WHITELIST_KEY).unwrap();
+            assert_eq!(state.count, 1);
+            assert_eq!(state.contracts.len(), 1);
+            assert_eq!(state.contracts.get(target).unwrap(), true);
+            assert_eq!(list_whitelisted(&env).unwrap().len(), 1);
         });
     }
 }
