@@ -69,3 +69,42 @@ describe("generateTypeDefinitions", () => {
     );
   });
 });
+
+describe("optional vs nullable fields", () => {
+  it("emits optional as `name?: T` and nullable as `T | null`", () => {
+    const output = generateTypeDefinitions({
+      structs: [
+        {
+          name: "S",
+          fields: [
+            { name: "a", tsType: "number", optional: true },
+            { name: "b", tsType: "string", nullable: true },
+            { name: "c", tsType: "bigint", optional: true, nullable: true },
+            { name: "d", tsType: "number" },
+          ],
+        },
+      ],
+    });
+    expect(output).toContain("a?: number;");
+    expect(output).toContain("b: string | null;");
+    expect(output).toContain("c?: bigint | null;");
+    expect(output).toContain("d: number;");
+  });
+
+  it("rejects a required parameter after an optional one", () => {
+    expect(() =>
+      generateTypeDefinitions({
+        functions: [
+          {
+            name: "f",
+            params: [
+              { name: "x", tsType: "number", optional: true },
+              { name: "y", tsType: "number" },
+            ],
+            returns: "void",
+          },
+        ],
+      }),
+    ).toThrow(/optional parameters/);
+  });
+});

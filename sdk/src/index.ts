@@ -5,10 +5,20 @@
  * Provides ergonomic wrappers for all public contract methods.
  */
 
-export { SLACalculatorClient, TimeoutError, decodeContractEvent } from "./client";
+export {
+  SLACalculatorClient,
+  TimeoutError,
+  ContractRequestError,
+  extractRequestId,
+  decodeContractEvent,
+} from "./client";
 export type {
   ClientConfig,
   ContractResult,
+  HeadersLike,
+  RpcRequest,
+  RpcResponse,
+  Transport,
   PreflightResult,
   ContractEvent,
   ContractEventCallback,

@@ -152,6 +152,15 @@ echo ""
 
 # Track deployment results
 declare -A DEPLOYMENT_RESULTS=()
+declare -A PARTIAL_IDS=()
+
+# Strip control characters, secret-looking keys (S... seeds), JSON-hostile
+# characters and excess length from a failure cause before it is recorded.
+sanitize_cause() {
+    printf '%s' "$1" | tr '\n\r\t' '   ' | tr -d '\000-\037"\\' \
+        | sed -E 's/S[A-Z2-7]{55}/[redacted]/g' | tr -s ' ' | cut -c1-200
+}
+
 
 # Deploy to each network
 for NETWORK in "${NETWORK_ARRAY[@]}"; do
@@ -169,39 +178,50 @@ for NETWORK in "${NETWORK_ARRAY[@]}"; do
     RPC_URL="${NETWORK_RPC_URLS[$NETWORK]}"
     
     if [[ "$DRY_RUN" == "false" ]]; then
-        # Build
-        log_info "  Building contract..."
-        stellar contract build --package sla_calculator
-        
-        # Optimize
-        WASM_PATH="target/wasm32-unknown-unknown/release/sla_calculator.wasm"
-        stellar contract optimize --wasm "$WASM_PATH"
-        OPTIMIZED_PATH="${WASM_PATH%.wasm}.optimized.wasm"
-        
-        # Deploy
-        log_info "  Deploying..."
-        CONTRACT_ID=$(stellar contract deploy \
-            --wasm "$OPTIMIZED_PATH" \
-            --network "$NETWORK" \
-            --source auto \
-            --rpc-url "$RPC_URL" \
-            --network-passphrase "$PASSPHRASE" \
-            2>&1 | tee /dev/stderr | grep -oP 'Contract ID: \K[a-zA-Z0-9]+')
-        
-        # Initialize
-        log_info "  Initializing..."
-        stellar contract invoke \
-            --id "$CONTRACT_ID" \
-            --fn initialize \
-            --arg "$ADMIN" \
-            --arg "$OPERATOR" \
-            --network "$NETWORK" \
-            --source auto \
-            --rpc-url "$RPC_URL" \
-            --network-passphrase "$PASSPHRASE"
-        
-        DEPLOYMENT_RESULTS[$NETWORK]="SUCCESS:$CONTRACT_ID"
-        log_success "  Deployed: $CONTRACT_ID"
+        # Run each network in its own subshell so one failure is recorded
+        # (with a sanitized cause) and the remaining networks still run.
+        ID_FILE=$(mktemp)
+        ERR_FILE=$(mktemp)
+        if (
+            set -euo pipefail
+            log_info "  Building contract..."
+            stellar contract build --package sla_calculator
+            WASM_PATH="target/wasm32-unknown-unknown/release/sla_calculator.wasm"
+            stellar contract optimize --wasm "$WASM_PATH"
+            OPTIMIZED_PATH="${WASM_PATH%.wasm}.optimized.wasm"
+            log_info "  Deploying..."
+            DEPLOY_OUT=$(stellar contract deploy \
+                --wasm "$OPTIMIZED_PATH" \
+                --network "$NETWORK" \
+                --source auto \
+                --rpc-url "$RPC_URL" \
+                --network-passphrase "$PASSPHRASE" 2>&1)
+            echo "$DEPLOY_OUT" >&2
+            CID=$(echo "$DEPLOY_OUT" | grep -oE 'C[A-Z2-7]{55}' | tail -n1 || true)
+            [[ -n "$CID" ]] || { echo "could not parse contract ID from deploy output" >&2; exit 1; }
+            # Record the ID before initialize so it survives a later failure.
+            echo "$CID" > "$ID_FILE"
+            log_info "  Initializing..."
+            stellar contract invoke \
+                --id "$CID" --fn initialize \
+                --arg "$ADMIN" --arg "$OPERATOR" \
+                --network "$NETWORK" --source auto \
+                --rpc-url "$RPC_URL" --network-passphrase "$PASSPHRASE"
+        ) 2> >(tee "$ERR_FILE" >&2); then
+            CONTRACT_ID=$(cat "$ID_FILE")
+            DEPLOYMENT_RESULTS[$NETWORK]="SUCCESS:$CONTRACT_ID"
+            log_success "  Deployed: $CONTRACT_ID"
+        else
+            CONTRACT_ID=$(cat "$ID_FILE" 2>/dev/null || true)
+            CAUSE=$(sanitize_cause "$(tail -n 5 "$ERR_FILE")")
+            DEPLOYMENT_RESULTS[$NETWORK]="FAILED:${CAUSE:-unknown error}"
+            # Preserve an ID that was deployed before the failure.
+            if [[ -n "$CONTRACT_ID" ]]; then
+                PARTIAL_IDS[$NETWORK]="$CONTRACT_ID"
+            fi
+            log_error "  Failed on $NETWORK: ${CAUSE:-unknown error}"
+        fi
+        rm -f "$ID_FILE" "$ERR_FILE"
     else
         log_info "  [DRY RUN] Would deploy to $NETWORK"
         DEPLOYMENT_RESULTS[$NETWORK]="DRY_RUN:PENDING"
@@ -227,7 +247,9 @@ for NETWORK in "${NETWORK_ARRAY[@]}"; do
 done
 
 # Write deployment manifest so contract addresses can be picked up by
-# backend configs / CI without re-parsing script output.
+# backend configs / CI without re-parsing script output. "networks" keeps
+# the legacy STATUS:value strings; "results" is the machine-readable form.
+ANY_FAILED=false
 {
     echo "{"
     echo "  \"deployedAt\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
@@ -238,12 +260,30 @@ done
     for NETWORK in "${NETWORK_ARRAY[@]}"; do
         NETWORK=$(echo "$NETWORK" | xargs)
         RESULT="${DEPLOYMENT_RESULTS[$NETWORK]:-NOT_STARTED}"
-        if [[ "$FIRST" == true ]]; then
-            FIRST=false
-        else
-            echo ","
-        fi
+        if [[ "$FIRST" == true ]]; then FIRST=false; else echo ","; fi
         printf '    "%s": "%s"' "$NETWORK" "$RESULT"
+    done
+    echo ""
+    echo "  },"
+    echo "  \"results\": {"
+    FIRST=true
+    for NETWORK in "${NETWORK_ARRAY[@]}"; do
+        NETWORK=$(echo "$NETWORK" | xargs)
+        RESULT="${DEPLOYMENT_RESULTS[$NETWORK]:-NOT_STARTED}"
+        STATUS="${RESULT%%:*}"
+        VALUE="${RESULT#*:}"
+        CID="null"; ERR="null"
+        if [[ "$STATUS" == "SUCCESS" ]]; then
+            CID="\"$VALUE\""
+        elif [[ "$STATUS" == "FAILED" ]]; then
+            ERR="\"$VALUE\""
+            ANY_FAILED=true
+            if [[ -n "${PARTIAL_IDS[$NETWORK]:-}" ]]; then CID="\"${PARTIAL_IDS[$NETWORK]}\""; fi
+        elif [[ "$STATUS" == "NOT_STARTED" ]]; then
+            STATUS="NOT_STARTED"
+        fi
+        if [[ "$FIRST" == true ]]; then FIRST=false; else echo ","; fi
+        printf '    "%s": {"status": "%s", "contractId": %s, "error": %s}' "$NETWORK" "$STATUS" "$CID" "$ERR"
     done
     echo ""
     echo "  }"
@@ -256,3 +296,10 @@ log_info "Next steps:"
 log_info "  1. Save contract IDs for each network"
 log_info "  2. Update backend configs with network-specific contract IDs"
 log_info "  3. Run smoke tests on each deployed contract"
+
+# Exit nonzero if any network failed so CI cannot treat a partial rollout
+# as success. Successful contract IDs are already in the manifest above.
+if [[ "$ANY_FAILED" == true ]]; then
+    log_error "One or more networks failed; see $MANIFEST_FILE"
+    exit 1
+fi

@@ -11,6 +11,24 @@
 export interface TypeGenField {
   name: string;
   tsType: string;
+  /**
+   * The key/argument may be omitted entirely (`name?: T`). Distinct from
+   * `nullable`: an omitted value is `undefined`, not `null`.
+   */
+  optional?: boolean;
+  /**
+   * The value is present but may be `null` (`T | null`), matching a
+   * Soroban `Option<T>` that decodes to `null`.
+   */
+  nullable?: boolean;
+}
+
+function fieldType(f: TypeGenField): string {
+  return f.nullable ? `${f.tsType} | null` : f.tsType;
+}
+
+function fieldDecl(f: TypeGenField): string {
+  return `${f.name}${f.optional ? "?" : ""}: ${fieldType(f)}`;
 }
 
 export interface TypeGenStruct {
@@ -51,15 +69,22 @@ export function generateTypeDefinitions(spec: TypeGenSpec): string {
   for (const struct of spec.structs ?? []) {
     lines.push(`export interface ${struct.name} {`);
     for (const field of struct.fields) {
-      lines.push(`  ${field.name}: ${field.tsType};`);
+      lines.push(`  ${fieldDecl(field)};`);
     }
     lines.push("}", "");
   }
 
   for (const fn of spec.functions ?? []) {
-    const params = fn.params
-      .map((p) => `${p.name}: ${p.tsType}`)
-      .join(", ");
+    const firstOptional = fn.params.findIndex((p) => p.optional);
+    if (
+      firstOptional !== -1 &&
+      fn.params.slice(firstOptional).some((p) => !p.optional)
+    ) {
+      throw new Error(
+        `Function ${fn.name}: optional parameters must come after all required ones`,
+      );
+    }
+    const params = fn.params.map(fieldDecl).join(", ");
     lines.push(
       `export declare function ${toCamelCase(fn.name)}(${params}): Promise<${fn.returns}>;`,
     );

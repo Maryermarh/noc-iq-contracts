@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   SLACalculatorClient,
   TimeoutError,
+  extractRequestId,
   decodeContractEvent,
   TransactionStatusResult,
 } from "../src/client";
@@ -245,5 +246,42 @@ describe("scval conversions", () => {
       a: 1,
       b: "two",
     });
+  });
+});
+
+describe("request ID on RPC failures", () => {
+  const base = {
+    contractId: "CABC1234567890ABCDEF",
+    networkPassphrase: "Testnet ; SDF Network ; September 2015",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+  };
+  const headers = (v: string | null) => ({ get: () => v });
+
+  it("attaches a sanitized request ID to a failed result", async () => {
+    const c = new SLACalculatorClient({
+      ...base,
+      transport: async () => ({
+        status: 500,
+        headers: headers("req-1<script>\n;abc"),
+        error: "boom",
+      }),
+    });
+    const r = await c.getConfig("critical");
+    expect(r.ok).toBe(false);
+    expect(r.requestId).toBe("req-1scriptabc");
+  });
+
+  it("omits requestId when no header is present", async () => {
+    const c = new SLACalculatorClient({
+      ...base,
+      transport: async () => ({ status: 500, error: "boom" }),
+    });
+    const r = await c.getConfig("critical");
+    expect("requestId" in r).toBe(false);
+  });
+
+  it("caps request ID length and drops IDs with nothing safe", () => {
+    expect(extractRequestId(headers("a".repeat(500)))?.length).toBe(128);
+    expect(extractRequestId(headers("<>\n"))).toBeUndefined();
   });
 });

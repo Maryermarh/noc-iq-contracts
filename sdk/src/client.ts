@@ -63,6 +63,70 @@ export interface ClientConfig {
   networkPassphrase: string;
   /** Base URL of the Soroban RPC server. */
   rpcUrl: string;
+  /**
+   * Optional transport used to send invocations. When omitted, `invoke`
+   * keeps its placeholder behaviour.
+   */
+  transport?: Transport;
+}
+
+/** Minimal structural headers shape (no DOM lib dependency). */
+export interface HeadersLike {
+  get(name: string): string | null;
+}
+
+export interface RpcRequest {
+  contractId: string;
+  networkPassphrase: string;
+  rpcUrl: string;
+  method: string;
+  args: ScVal[];
+}
+
+export interface RpcResponse {
+  status: number;
+  headers?: HeadersLike;
+  value?: unknown;
+  error?: string;
+  contractErrorCode?: number;
+}
+
+export type Transport = (request: RpcRequest) => Promise<RpcResponse>;
+
+const REQUEST_ID_HEADERS = ["x-request-id", "x-amzn-requestid", "x-correlation-id"];
+const MAX_REQUEST_ID_LENGTH = 128;
+
+/**
+ * Reads a request ID from response headers and sanitizes it so it is safe
+ * to log or show: only `[A-Za-z0-9._:-]` survive and the length is capped.
+ * Returns `undefined` when no header is present or nothing safe remains,
+ * so callers never see an empty or fabricated ID.
+ */
+export function extractRequestId(
+  headers: HeadersLike | undefined,
+): string | undefined {
+  if (!headers) return undefined;
+  for (const name of REQUEST_ID_HEADERS) {
+    const raw = headers.get(name);
+    if (typeof raw !== "string") continue;
+    const clean = raw
+      .replace(/[^A-Za-z0-9._:-]/g, "")
+      .slice(0, MAX_REQUEST_ID_LENGTH);
+    if (clean.length > 0) return clean;
+  }
+  return undefined;
+}
+
+/** Typed error carrying the (sanitized) request ID of the failing call. */
+export class ContractRequestError extends Error {
+  readonly requestId?: string;
+  readonly contractErrorCode?: number;
+  constructor(message: string, requestId?: string, contractErrorCode?: number) {
+    super(message);
+    this.name = "ContractRequestError";
+    if (requestId !== undefined) this.requestId = requestId;
+    if (contractErrorCode !== undefined) this.contractErrorCode = contractErrorCode;
+  }
 }
 
 /**
@@ -75,6 +139,10 @@ export interface ContractResult<T> {
   value?: T;
   /** Error message (present when ok is false). */
   error?: string;
+  /** Sanitized request ID from the RPC response; absent if none was sent. */
+  requestId?: string;
+  /** Numeric contract error code, when the failure was a contract error. */
+  contractErrorCode?: number;
 }
 
 /**
@@ -628,6 +696,31 @@ export class SLACalculatorClient {
     // Convert typed JS/TS arguments into ScVal-shaped structures — this is
     // what a real invocation would pass to `contract.call(method, ...)`.
     const _scArgs: ScVal[] = args.map(toScVal);
+
+    if (this.config.transport) {
+      const response = await this.config.transport({
+        contractId: this.config.contractId,
+        networkPassphrase: this.config.networkPassphrase,
+        rpcUrl: this.config.rpcUrl,
+        method: _method,
+        args: _scArgs,
+      });
+      const requestId = extractRequestId(response.headers);
+      if (response.status >= 400 || response.error !== undefined) {
+        const result: ContractResult<T> = {
+          ok: false,
+          error: response.error ?? `RPC request failed with status ${response.status}`,
+        };
+        if (requestId !== undefined) result.requestId = requestId;
+        if (response.contractErrorCode !== undefined) {
+          result.contractErrorCode = response.contractErrorCode;
+        }
+        return result;
+      }
+      const result: ContractResult<T> = { ok: true, value: response.value as T };
+      if (requestId !== undefined) result.requestId = requestId;
+      return result;
+    }
 
     // Production implementation would use @stellar/stellar-sdk:
     //   const contract = new Contract(this.config.contractId);

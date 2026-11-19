@@ -62,13 +62,19 @@ set -e
 assert_exit_code "--dry-run with --admin exits 0" 0 "$CODE"
 assert_file_exists "dry-run writes a deployment manifest" "$MANIFEST"
 
-# --- Test: unknown network is reported as failed, not fatal ---
+# --- Test: unknown network is recorded as failed and the script exits nonzero ---
 MANIFEST2="$TMP_DIR/manifest2.json"
 set +e
 "$TARGET" --admin GADMIN123 --networks BOGUSNET --dry-run --manifest "$MANIFEST2" >/dev/null 2>&1
 CODE=$?
 set -e
-assert_exit_code "unrecognised network still exits 0 (reported, not fatal)" 0 "$CODE"
+assert_exit_code "unrecognised network exits nonzero" 1 "$CODE"
+assert_file_exists "failed run still writes a manifest" "$MANIFEST2"
+if grep -q '"status": "FAILED"' "$MANIFEST2" && grep -q '"contractId": null' "$MANIFEST2"; then
+    echo "PASS: manifest records per-network FAILED status"
+else
+    echo "FAIL: manifest missing per-network FAILED status"; FAILURES=$((FAILURES + 1))
+fi
 
 if [[ "$FAILURES" -eq 0 ]]; then
     echo ""
