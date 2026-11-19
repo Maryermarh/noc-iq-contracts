@@ -310,3 +310,74 @@ mod event_ordering_tests {
         assert_eq!(first_out_of_order(&[5, 4, 3]), Some(1));
     }
 }
+
+#[cfg(test)]
+mod mixed_family_order_tests {
+    extern crate std;
+
+    use crate::event_schema::{
+        family_precedes, family_rank, EventFamily, MIXED_EVENT_ORDER_RULE,
+    };
+    use soroban_sdk::{symbol_short, Env, Symbol};
+
+    #[derive(Clone)]
+    struct MixedEvent {
+        family: EventFamily,
+        name: Symbol,
+        reference: Symbol,
+    }
+
+    /// Stable insertion sort: config events move ahead of calculation
+    /// events, while events within a family keep their emission order and
+    /// their payload reference.
+    fn order(events: &[MixedEvent]) -> std::vec::Vec<MixedEvent> {
+        let mut ordered: std::vec::Vec<MixedEvent> = std::vec::Vec::new();
+        for event in events.iter() {
+            let mut at = ordered.len();
+            while at > 0 && family_precedes(event.family, ordered[at - 1].family) {
+                at -= 1;
+            }
+            ordered.insert(at, event.clone());
+        }
+        ordered
+    }
+
+    #[test]
+    fn the_ordering_rule_is_documented() {
+        assert!(MIXED_EVENT_ORDER_RULE.contains("config"));
+        assert!(MIXED_EVENT_ORDER_RULE.contains("calculation"));
+    }
+
+    #[test]
+    fn config_events_precede_calculation_events_and_keep_references() {
+        let env = Env::default();
+        let mixed = [
+            MixedEvent {
+                family: EventFamily::Calculation,
+                name: symbol_short!("sla_calc"),
+                reference: symbol_short!("OUT1"),
+            },
+            MixedEvent {
+                family: EventFamily::Config,
+                name: symbol_short!("cfg_upd"),
+                reference: symbol_short!("OUT2"),
+            },
+            MixedEvent {
+                family: EventFamily::Calculation,
+                name: symbol_short!("set_int"),
+                reference: symbol_short!("OUT3"),
+            },
+        ];
+
+        let ordered = order(&mixed);
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered[0].name, symbol_short!("cfg_upd"));
+        assert_eq!(ordered[1].name, symbol_short!("sla_calc"));
+        assert_eq!(ordered[2].name, symbol_short!("set_int"));
+        assert_eq!(ordered[0].reference, symbol_short!("OUT2"));
+        assert_eq!(ordered[1].reference, symbol_short!("OUT1"));
+        assert_eq!(family_rank(EventFamily::Config), 0);
+        assert_eq!(family_rank(EventFamily::Calculation), 1);
+        let _ = &env;
+    }
+}

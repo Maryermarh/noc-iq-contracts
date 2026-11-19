@@ -50,6 +50,36 @@ pub fn renew_persistent_ttl(
     RenewalOutcome::Requested
 }
 
+/// #1029 — whether a read path may refresh a record's lifetime.
+///
+/// A record with no remaining lifetime is expired and must stay absent; a
+/// live record follows the documented retention threshold policy.
+pub fn should_refresh_after_read(remaining_ledgers: u32, threshold: u32) -> bool {
+    remaining_ledgers > 0 && remaining_ledgers < threshold
+}
+
+#[cfg(test)]
+mod read_refresh_tests {
+    use super::*;
+
+    #[test]
+    fn expired_records_are_never_refreshed_by_a_read() {
+        assert!(!should_refresh_after_read(0, MIN_INSTANCE_TTL_LEDGERS));
+    }
+
+    #[test]
+    fn live_records_are_refreshed_only_below_the_threshold() {
+        assert!(should_refresh_after_read(
+            MIN_INSTANCE_TTL_LEDGERS - 1,
+            MIN_INSTANCE_TTL_LEDGERS
+        ));
+        assert!(!should_refresh_after_read(
+            MIN_INSTANCE_TTL_LEDGERS,
+            MIN_INSTANCE_TTL_LEDGERS
+        ));
+    }
+}
+
 #[cfg(test)]
 mod renewal_tests {
     use super::*;

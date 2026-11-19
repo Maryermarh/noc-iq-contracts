@@ -97,7 +97,7 @@
 //! end) are NOT considered breaking and do not require a version bump as long
 //! as old consumers ignore unrecognised trailing fields.
 
-use soroban_sdk::{contracttype, symbol_short, Env, Symbol};
+use soroban_sdk::{contracttype, symbol_short, Env, Symbol, Vec};
 
 use crate::SLAError;
 

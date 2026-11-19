@@ -308,3 +308,86 @@ mod topic_stability_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod schema_compatibility_tests {
+    use crate::event_schema::{
+        check_schema_compatibility, EventFieldSchema, EventSchema,
+    };
+    use soroban_sdk::{symbol_short, Env};
+
+    fn field(env: &Env, name: &str, ty: &str, required: bool) -> EventFieldSchema {
+        EventFieldSchema {
+            name: Symbol::new(env, name),
+            field_type: Symbol::new(env, ty),
+            required,
+        }
+    }
+
+    fn schema(env: &Env, fields: soroban_sdk::Vec<EventFieldSchema>) -> EventSchema {
+        EventSchema {
+            event: symbol_short!("sla_calc"),
+            fields,
+        }
+    }
+
+    #[test]
+    fn a_field_type_change_is_rejected_with_the_event_and_field_name() {
+        let env = Env::default();
+        let old = schema(
+            &env,
+            soroban_sdk::Vec::from_array(
+                &env,
+                [field(&env, "amount", "i128", true), field(&env, "status", "symbol", true)],
+            ),
+        );
+        let new = schema(
+            &env,
+            soroban_sdk::Vec::from_array(
+                &env,
+                [field(&env, "amount", "u32", true), field(&env, "status", "symbol", true)],
+            ),
+        );
+
+        let result = check_schema_compatibility(&old, &new);
+        assert!(!result.compatible);
+        assert_eq!(result.event, symbol_short!("sla_calc"));
+        assert_eq!(result.changed_field, Some(Symbol::new(&env, "amount")));
+        assert_eq!(result.reason, Some(symbol_short!("type_change")));
+    }
+
+    #[test]
+    fn removing_a_required_field_is_rejected() {
+        let env = Env::default();
+        let old = schema(
+            &env,
+            soroban_sdk::Vec::from_array(
+                &env,
+                [field(&env, "amount", "i128", true), field(&env, "status", "symbol", true)],
+            ),
+        );
+        let new = schema(
+            &env,
+            soroban_sdk::Vec::from_array(&env, [field(&env, "amount", "i128", true)]),
+        );
+
+        let result = check_schema_compatibility(&old, &new);
+        assert!(!result.compatible);
+        assert_eq!(result.changed_field, Some(Symbol::new(&env, "status")));
+    }
+
+    #[test]
+    fn adding_an_optional_field_is_compatible() {
+        let env = Env::default();
+        let old = schema(
+            &env,
+            soroban_sdk::Vec::from_array(&env, [field(&env, "amount", "i128", true)]),
+        );
+        let mut fields = soroban_sdk::Vec::new(&env);
+        fields.push_back(field(&env, "amount", "i128", true));
+        fields.push_back(field(&env, "note", "string", false));
+        let new = schema(&env, fields);
+
+        assert!(check_schema_compatibility(&old, &new).compatible);
+    }
+}
