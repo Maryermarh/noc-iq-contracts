@@ -19,6 +19,8 @@ import {
   Severity,
 } from "./types";
 import { ScVal, toScVal, fromScVal } from "./scval";
+import { decodeContractError } from "./types";
+import { encodeHistoryRequest, HistoryRequest } from "./cursor";
 
 // The project's tsconfig targets ES2020 with no DOM/Node lib, so the
 // ambient `setTimeout` global isn't declared even though it exists at
@@ -63,7 +65,54 @@ export interface ClientConfig {
   networkPassphrase: string;
   /** Base URL of the Soroban RPC server. */
   rpcUrl: string;
+  /** Sends one RPC request. Without it, `invoke` returns the typed placeholder result. */
+  transport?: Transport;
+  /** Retry policy for transient transport failures (defaults to 3 attempts, 250 ms base delay). */
+  retry?: Partial<RetryPolicy>;
+  /** Cancels in-flight and pending requests; see {@link SLACalculatorClient.withSignal}. */
+  signal?: AbortSignalLike;
 }
+
+/** The part of `AbortSignal` the SDK needs (the project builds without the DOM lib). */
+export interface AbortSignalLike {
+  readonly aborted: boolean;
+  addEventListener(type: "abort", listener: () => void): void;
+  removeEventListener(type: "abort", listener: () => void): void;
+}
+
+/** Minimal `Headers` shape. */
+export interface HeadersLike {
+  get(name: string): string | null;
+}
+
+export interface RpcRequest {
+  method: string;
+  args: ScVal[];
+}
+
+export interface RpcResponse {
+  /** HTTP-style status; 5xx and 429 are treated as transient. */
+  status: number;
+  headers?: HeadersLike;
+  value?: unknown;
+  error?: string;
+  /** Numeric contract error code (`Error(Contract, #N)`), when the failure came from the contract. */
+  contractErrorCode?: number;
+}
+
+export type Transport = (request: RpcRequest, signal?: AbortSignalLike) => Promise<RpcResponse>;
+
+export interface RetryPolicy {
+  /** Total attempts including the first one. */
+  maxAttempts: number;
+  /** Delay before the first retry; doubles each attempt. */
+  baseDelayMs: number;
+}
+
+const DEFAULT_RETRY: RetryPolicy = { maxAttempts: 3, baseDelayMs: 250 };
+
+/** Stable, machine-readable code placed on {@link ContractResult.errorCode}. */
+export const CANCELLED_ERROR_CODE = "CANCELLED";
 
 /**
  * Generic contract invocation result wrapper.
@@ -75,6 +124,15 @@ export interface ContractResult<T> {
   value?: T;
   /** Error message (present when ok is false). */
   error?: string;
+  /**
+   * Stable error identifier: the contract error name (e.g. "Unauthorized") for contract failures,
+   * or {@link CANCELLED_ERROR_CODE} when the caller aborted the request.
+   */
+  errorCode?: string;
+  /** Numeric contract error code, when the failure was a contract `Err(...)`. */
+  contractErrorCode?: number;
+  /** True only when the request was aborted by the caller. Aborted requests are never retried. */
+  cancelled?: boolean;
 }
 
 /**
@@ -127,6 +185,15 @@ export class SLACalculatorClient {
 
   constructor(config: ClientConfig) {
     this.config = config;
+  }
+
+  /**
+   * Returns a client that shares this configuration but whose requests stop as soon as `signal`
+   * aborts (issue #1069). An aborted call resolves to `{ ok: false, cancelled: true,
+   * errorCode: "CANCELLED" }` and is never retried.
+   */
+  withSignal(signal: AbortSignalLike): SLACalculatorClient {
+    return new SLACalculatorClient({ ...this.config, signal });
   }
 
   get contractAddress(): string {
@@ -301,6 +368,20 @@ export class SLACalculatorClient {
     limit: number,
   ): Promise<ContractResult<SLAResult[]>> {
     return this.invoke("get_history_page", [offset, limit]);
+  }
+
+  /**
+   * Returns a page of history addressed by an opaque cursor token (issue #1070). The cursor is
+   * validated locally first: a malformed or oversized token rejects with a
+   * `CursorValidationError` before any network access.
+   *
+   * @param request - `{ cursor?, limit }`; omit `cursor` for the first page.
+   */
+  async getHistoryPageByCursor(
+    request: HistoryRequest,
+  ): Promise<ContractResult<SLAResult[]>> {
+    const args = encodeHistoryRequest(request);
+    return this.invoke("get_history_page_cursor", args);
   }
 
   /**
@@ -622,22 +703,63 @@ export class SLACalculatorClient {
    * @returns Typed result wrapper.
    */
   protected async invoke<T>(
-    _method: string,
+    method: string,
     args: unknown[],
   ): Promise<ContractResult<T>> {
     // Convert typed JS/TS arguments into ScVal-shaped structures — this is
     // what a real invocation would pass to `contract.call(method, ...)`.
-    const _scArgs: ScVal[] = args.map(toScVal);
+    const scArgs: ScVal[] = args.map(toScVal);
 
-    // Production implementation would use @stellar/stellar-sdk:
-    //   const contract = new Contract(this.config.contractId);
-    //   const tx = new TransactionBuilder(account)
-    //     .addOperation(contract.call(method, ..._scArgs))
-    //     .build();
-    // ... sign, simulate, and decode the result via fromScVal().
-    //
-    // For now return a placeholder that demonstrates the typed interface.
-    return { ok: true, value: undefined as T };
+    const { transport, signal } = this.config;
+    if (!transport) {
+      // No transport configured: return the typed placeholder (the default for local use and tests).
+      // Production implementation would use @stellar/stellar-sdk:
+      //   const contract = new Contract(this.config.contractId);
+      //   const tx = new TransactionBuilder(account)
+      //     .addOperation(contract.call(method, ...scArgs))
+      //     .build();
+      return { ok: true, value: undefined as T };
+    }
+    return this.sendWithRetry<T>({ method, args: scArgs }, transport, signal);
+  }
+
+  /**
+   * Sends a request, retrying transient failures (network errors, 5xx, 429) with exponential
+   * backoff. Cancellation is final: an aborted request stops immediately, is never retried, and
+   * surfaces as a typed `cancelled` result (issue #1069).
+   */
+  private async sendWithRetry<T>(
+    request: RpcRequest,
+    transport: Transport,
+    signal?: AbortSignalLike,
+  ): Promise<ContractResult<T>> {
+    const policy: RetryPolicy = { ...DEFAULT_RETRY, ...this.config.retry };
+
+    for (let attempt = 1; ; attempt++) {
+      if (signal?.aborted) return cancelledResult<T>();
+
+      let response: RpcResponse;
+      try {
+        response = await abortable(transport(request, signal), signal);
+      } catch (err) {
+        if (err === ABORTED || signal?.aborted || isAbortError(err)) return cancelledResult<T>();
+        if (attempt >= policy.maxAttempts) {
+          return { ok: false, error: errorMessage(err) };
+        }
+        if (!(await delay(policy.baseDelayMs * 2 ** (attempt - 1), signal))) {
+          return cancelledResult<T>();
+        }
+        continue;
+      }
+
+      if (isTransientStatus(response.status) && attempt < policy.maxAttempts) {
+        if (!(await delay(policy.baseDelayMs * 2 ** (attempt - 1), signal))) {
+          return cancelledResult<T>();
+        }
+        continue;
+      }
+      return toResult<T>(response);
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -834,6 +956,73 @@ export type TransactionStatus = "SUCCESS" | "FAILED" | "NOT_FOUND" | "PENDING";
 export interface TransactionStatusResult {
   status: TransactionStatus;
   txHash: string;
+}
+
+const ABORTED = Symbol("aborted");
+
+function cancelledResult<T>(): ContractResult<T> {
+  return { ok: false, cancelled: true, errorCode: CANCELLED_ERROR_CODE, error: "Request was cancelled" };
+}
+
+function isAbortError(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as { name?: string }).name === "AbortError";
+}
+
+function isTransientStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Rejects with {@link ABORTED} as soon as `signal` aborts, even if the transport ignores it. */
+function abortable<T>(promise: Promise<T>, signal?: AbortSignalLike): Promise<T> {
+  if (!signal) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(ABORTED);
+    if (signal.aborted) return onAbort();
+    signal.addEventListener("abort", onAbort);
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** Waits `ms`; resolves `false` (without waiting out the delay) if `signal` aborts first. */
+function delay(ms: number, signal?: AbortSignalLike): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    if (signal?.aborted) return resolve(false);
+    const onAbort = () => resolve(false);
+    signal?.addEventListener("abort", onAbort);
+    setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, ms);
+  });
+}
+
+function toResult<T>(response: RpcResponse): ContractResult<T> {
+  if (response.status < 400 && response.error === undefined) {
+    return { ok: true, value: response.value as T };
+  }
+  if (response.contractErrorCode !== undefined) {
+    const decoded = decodeContractError(response.contractErrorCode);
+    return {
+      ok: false,
+      error: decoded.message,
+      errorCode: decoded.name,
+      contractErrorCode: decoded.code,
+    };
+  }
+  return { ok: false, error: response.error ?? `Request failed with status ${response.status}` };
 }
 
 /**

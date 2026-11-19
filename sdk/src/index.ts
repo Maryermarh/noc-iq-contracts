@@ -5,10 +5,24 @@
  * Provides ergonomic wrappers for all public contract methods.
  */
 
-export { SLACalculatorClient, TimeoutError, decodeContractEvent } from "./client";
+export { SLACalculatorClient, TimeoutError, decodeContractEvent, CANCELLED_ERROR_CODE } from "./client";
+export {
+  CursorValidationError,
+  MAX_CURSOR_LENGTH,
+  validateCursor,
+  encodeHistoryRequest,
+  decodeHistoryRequest,
+} from "./cursor";
+export type { HistoryRequest } from "./cursor";
 export type {
   ClientConfig,
   ContractResult,
+  AbortSignalLike,
+  HeadersLike,
+  RpcRequest,
+  RpcResponse,
+  Transport,
+  RetryPolicy,
   PreflightResult,
   ContractEvent,
   ContractEventCallback,

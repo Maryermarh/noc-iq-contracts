@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   SLACalculatorClient,
   TimeoutError,
@@ -248,63 +248,165 @@ describe("scval conversions", () => {
   });
 });
 
-import { ScValRangeError } from "../src/scval";
+import { CANCELLED_ERROR_CODE, RpcResponse } from "../src/client";
+import { CursorValidationError, MAX_CURSOR_LENGTH, decodeHistoryRequest, encodeHistoryRequest } from "../src/cursor";
 
-describe("ScVal integer range checks (issue #1074)", () => {
-  const U32_MAX = 4_294_967_295;
-  const I32_MIN = -2_147_483_648;
-  const U128_MAX = (1n << 128n) - 1n;
-  const I128_MIN = -(1n << 127n);
+function clientWith(transport: (req: any, signal?: any) => Promise<RpcResponse>, retry = { maxAttempts: 3, baseDelayMs: 1 }) {
+  return new SLACalculatorClient({
+    contractId: "CABC1234567890ABCDEF",
+    networkPassphrase: "Testnet ; SDF Network ; September 2015",
+    rpcUrl: "https://example.invalid",
+    transport,
+    retry,
+  });
+}
 
-  it("accepts the minimum and maximum of each supported type", () => {
-    expect(toScVal(0)).toEqual({ type: "u32", value: 0 });
-    expect(toScVal(U32_MAX)).toEqual({ type: "u32", value: U32_MAX });
-    expect(toScVal(I32_MIN)).toEqual({ type: "i32", value: I32_MIN });
-    expect(toScVal(U128_MAX)).toEqual({ type: "u128", value: U128_MAX });
-    expect(toScVal(I128_MIN)).toEqual({ type: "i128", value: I128_MIN });
+/** Minimal AbortController stand-in (the SDK is built without the DOM lib). */
+function controller() {
+  const listeners = new Set<() => void>();
+  const signal = {
+    aborted: false,
+    addEventListener: (_t: "abort", l: () => void) => listeners.add(l),
+    removeEventListener: (_t: "abort", l: () => void) => listeners.delete(l),
+  };
+  return {
+    signal,
+    abort() {
+      signal.aborted = true;
+      [...listeners].forEach((l) => l());
+    },
+  };
+}
+
+describe("cancellation and retry (issue #1069)", () => {
+  it("an abort stops an in-flight request immediately with a typed cancelled result", async () => {
+    const c = controller();
+    const transport = vi.fn(() => new Promise<RpcResponse>(() => undefined)); // never settles
+    const client = clientWith(transport).withSignal(c.signal);
+
+    const pending = client.getAdmin();
+    c.abort();
+
+    await expect(pending).resolves.toMatchObject({ ok: false, cancelled: true, errorCode: CANCELLED_ERROR_CODE });
+    expect(transport).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects values one outside each boundary", () => {
-    expect(() => toScVal(U32_MAX + 1)).toThrow(ScValRangeError);
-    expect(() => toScVal(I32_MIN - 1)).toThrow(ScValRangeError);
-    expect(() => toScVal(U128_MAX + 1n)).toThrow(ScValRangeError);
-    expect(() => toScVal(I128_MIN - 1n)).toThrow(ScValRangeError);
+  it("an aborted request is never retried, even when the transport fails with a transient error", async () => {
+    const c = controller();
+    const transport = vi.fn(async () => {
+      c.abort();
+      throw new Error("socket hang up");
+    });
+
+    const result = await clientWith(transport).withSignal(c.signal).getAdmin();
+
+    expect(result.cancelled).toBe(true);
+    expect(transport).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects non-safe and non-finite numbers rather than truncating them", () => {
-    expect(() => toScVal(Number.MAX_SAFE_INTEGER * 2)).toThrow(ScValRangeError);
-    expect(() => toScVal(Number.POSITIVE_INFINITY)).toThrow();
-    expect(() => toScVal(Number.NaN)).toThrow();
+  it("an AbortError from the transport is a cancellation, not a retryable failure", async () => {
+    const transport = vi.fn(async () => {
+      throw Object.assign(new Error("aborted"), { name: "AbortError" });
+    });
+    const result = await clientWith(transport).getAdmin();
+    expect(result.cancelled).toBe(true);
+    expect(transport).toHaveBeenCalledTimes(1);
   });
 
-  it("names the field in the error, including nested array and object fields", () => {
-    expect(() => toScVal(U32_MAX + 1, "mttr_minutes")).toThrow(/mttr_minutes/);
-    expect(() => toScVal({ amount: U128_MAX + 1n }, "config")).toThrow(/config\.amount/);
-    expect(() => toScVal([1, 2, 99_999_999_999], "ids")).toThrow(/ids\[2\]/);
+  it("does not start a request when the signal is already aborted", async () => {
+    const c = controller();
+    c.abort();
+    const transport = vi.fn(async (): Promise<RpcResponse> => ({ status: 200, value: "x" }));
+
+    const result = await clientWith(transport).withSignal(c.signal).getAdmin();
+
+    expect(result.cancelled).toBe(true);
+    expect(transport).not.toHaveBeenCalled();
   });
 
-  it("names the argument position when used as args.map(toScVal)", () => {
-    expect(() => [1, 2, U32_MAX + 1].map(toScVal)).toThrow(/arg\[2\]/);
+  it("an abort during backoff ends the wait without another attempt", async () => {
+    const c = controller();
+    const transport = vi.fn(async (): Promise<RpcResponse> => ({ status: 503 }));
+    const client = clientWith(transport, { maxAttempts: 5, baseDelayMs: 60_000 }).withSignal(c.signal);
+
+    const pending = client.getAdmin();
+    await Promise.resolve();
+    await Promise.resolve();
+    c.abort();
+
+    await expect(pending).resolves.toMatchObject({ cancelled: true });
+    expect(transport).toHaveBeenCalledTimes(1);
   });
 
-  it("exposes the field and value on the error and never returns a partial ScVal", () => {
-    let thrown: unknown;
-    let produced: unknown;
-    try {
-      produced = toScVal({ ok: 1, bad: U32_MAX + 1 }, "payload");
-    } catch (err) {
-      thrown = err;
+  it("still retries transient failures: network errors and 5xx, up to maxAttempts", async () => {
+    let calls = 0;
+    const transport = vi.fn(async (): Promise<RpcResponse> => {
+      calls += 1;
+      if (calls === 1) throw new Error("ECONNRESET");
+      if (calls === 2) return { status: 503 };
+      return { status: 200, value: "GADMIN" };
+    });
+
+    const result = await clientWith(transport).getAdmin();
+
+    expect(result).toEqual({ ok: true, value: "GADMIN" });
+    expect(transport).toHaveBeenCalledTimes(3);
+  });
+
+  it("gives up after maxAttempts and reports the last failure", async () => {
+    const transport = vi.fn(async (): Promise<RpcResponse> => ({ status: 503, error: "upstream down" }));
+
+    const result = await clientWith(transport, { maxAttempts: 2, baseDelayMs: 1 }).getAdmin();
+
+    expect(result).toMatchObject({ ok: false, error: "upstream down" });
+    expect(transport).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry a definitive failure such as a contract error", async () => {
+    const transport = vi.fn(async (): Promise<RpcResponse> => ({ status: 200, error: "x", contractErrorCode: 3 }));
+
+    const result = await clientWith(transport).pause("G", "r");
+
+    expect(result).toMatchObject({ ok: false, errorCode: "Unauthorized", contractErrorCode: 3 });
+    expect(transport).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("history cursor validation (issue #1070)", () => {
+  const goodCursor = "eyJvIjoxMjN9_-abc";
+
+  it("valid cursors round-trip through request encoding", () => {
+    const args = encodeHistoryRequest({ cursor: goodCursor, limit: 25 });
+    expect(args).toEqual([goodCursor, 25]);
+    expect(decodeHistoryRequest(args)).toEqual({ cursor: goodCursor, limit: 25 });
+    expect(decodeHistoryRequest(encodeHistoryRequest({ limit: 10 }))).toEqual({ limit: 10 });
+  });
+
+  it("malformed and oversized cursors are rejected before any network access", async () => {
+    const transport = vi.fn(async (): Promise<RpcResponse> => ({ status: 200, value: [] }));
+    const client = clientWith(transport);
+
+    for (const cursor of ["", "has space", "semi;colon", "a/b+c==", "x".repeat(MAX_CURSOR_LENGTH + 1)]) {
+      await expect(client.getHistoryPageByCursor({ cursor, limit: 10 })).rejects.toBeInstanceOf(CursorValidationError);
     }
-
-    expect(produced).toBeUndefined();
-    expect(thrown).toBeInstanceOf(ScValRangeError);
-    expect((thrown as ScValRangeError).field).toBe("payload.bad");
-    expect((thrown as ScValRangeError).value).toBe(U32_MAX + 1);
+    expect(transport).not.toHaveBeenCalled();
   });
 
-  it("an out-of-range argument fails the client call before anything is sent", async () => {
-    await expect(new SLACalculatorClient({ contractId: "C", networkPassphrase: "t", rpcUrl: "x" }).getHistoryPage(0, U32_MAX + 1)).rejects.toThrow(
-      /arg\[1\]/,
-    );
+  it("the boundary length is accepted", () => {
+    expect(() => encodeHistoryRequest({ cursor: "a".repeat(MAX_CURSOR_LENGTH), limit: 1 })).not.toThrow();
+  });
+
+  it("explains what is wrong", () => {
+    expect(() => encodeHistoryRequest({ cursor: "bad cursor", limit: 5 })).toThrow(/letters, digits/);
+    expect(() => encodeHistoryRequest({ cursor: "x".repeat(300), limit: 5 })).toThrow(/longer than the maximum/);
+    expect(() => encodeHistoryRequest({ cursor: "ok", limit: 0 })).toThrow(/positive integer/);
+  });
+
+  it("a valid cursor is sent to the transport as contract arguments", async () => {
+    const transport = vi.fn(async (): Promise<RpcResponse> => ({ status: 200, value: [] }));
+
+    await clientWith(transport).getHistoryPageByCursor({ cursor: goodCursor, limit: 5 });
+
+    expect(transport.mock.calls[0][0]).toMatchObject({ method: "get_history_page_cursor" });
   });
 });

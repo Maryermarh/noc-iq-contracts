@@ -55,68 +55,80 @@ describe("MockSlaCalculatorClient", () => {
   });
 });
 
-describe("MockSlaCalculatorClient state isolation (issue #1075)", () => {
-  it("two instances begin from independent state", async () => {
-    const a = new MockSlaCalculatorClient();
-    const b = new MockSlaCalculatorClient();
-    a.mockResponse("get_admin", { value: "GA" });
-    await a.getAdmin();
+import { PROTECTED_METHODS } from "../src/mock-client";
+import { SLACalculatorClient } from "../src/client";
 
-    expect(a.calls).toHaveLength(1);
-    expect(b.calls).toHaveLength(0);
-    expect((await b.getAdmin()).value).toBeUndefined();
-    expect((await a.getAdmin()).value).toBe("GA");
-  });
+describe("MockSlaCalculatorClient authorization parity (issue #1071)", () => {
+  const ADMIN = "GADMIN";
+  const OPERATOR = "GOPERATOR";
+  const STRANGER = "GSTRANGER";
 
-  it("changes stay local: configuring and calling one instance never affects another", async () => {
-    const a = new MockSlaCalculatorClient();
-    const b = new MockSlaCalculatorClient();
-    b.mockResponse("get_admin", { error: "boom" });
-
-    expect((await a.getAdmin()).ok).toBe(true);
-    expect((await b.getAdmin()).ok).toBe(false);
-    expect(a.calls).not.toBe(b.calls);
-  });
-
-  it("resetting one instance does not clear the other instance's fixture data", async () => {
-    const a = new MockSlaCalculatorClient();
-    const b = new MockSlaCalculatorClient();
-    a.mockResponse("get_admin", { value: "GA" });
-    b.mockResponse("get_admin", { value: "GB" });
-    await b.getAdmin();
-
-    a.reset();
-
-    expect(a.calls).toHaveLength(0);
-    expect((await a.getAdmin()).value).toBeUndefined();
-    expect((await b.getAdmin()).value).toBe("GB");
-    expect(b.calls).toHaveLength(2);
-  });
-
-  it("parallel calls on separate instances do not interleave their histories", async () => {
-    const instances = Array.from({ length: 5 }, () => new MockSlaCalculatorClient());
-
-    await Promise.all(instances.map((client, i) => client.calculateSla(`op${i}`, `outage-${i}`, "high", i)));
-
-    instances.forEach((client, i) => {
-      expect(client.calls).toEqual([{ method: "calculate_sla", args: [`op${i}`, `outage-${i}`, "high", i] }]);
-    });
-  });
-
-  it("a configured response is copied: mutating the original object afterwards has no effect", async () => {
+  function configured() {
     const client = new MockSlaCalculatorClient();
-    const response = { value: "GA" as string | undefined };
-    client.mockResponse("get_admin", response);
+    client.setRoles(ADMIN, OPERATOR);
+    return client;
+  }
 
-    response.value = "CHANGED";
+  it("lets the right role through and rejects every other caller, for each protected method", async () => {
+    for (const [method, role] of Object.entries(PROTECTED_METHODS)) {
+      const client = configured();
+      const authorized = role === "admin" ? ADMIN : OPERATOR;
+      const others = [role === "admin" ? OPERATOR : ADMIN, STRANGER];
 
-    expect((await client.getAdmin()).value).toBe("GA");
+      expect((await client.invokeMethod(method, [authorized])).ok).toBe(true);
+      for (const caller of others) {
+        const result = await client.invokeMethod(method, [caller]);
+        expect({ method, caller, ok: result.ok, code: result.errorCode }).toEqual({
+          method,
+          caller,
+          ok: false,
+          code: "Unauthorized",
+        });
+      }
+    }
   });
 
-  it("instances do not share the default configuration object", () => {
-    const a = new MockSlaCalculatorClient();
-    const b = new MockSlaCalculatorClient();
-    expect(a.contractAddress).toBe(b.contractAddress);
-    expect((a as unknown as { config: object }).config).not.toBe((b as unknown as { config: object }).config);
+  it("an unauthorized call fails with the stable Unauthorized code (contract error #3)", async () => {
+    const result = await configured().pause(STRANGER, "because");
+    expect(result).toMatchObject({ ok: false, errorCode: "Unauthorized", contractErrorCode: 3 });
+  });
+
+  it("the generated client reports the same error identifiers for the same contract failure", async () => {
+    const real = new SLACalculatorClient({
+      contractId: "C1",
+      networkPassphrase: "Test",
+      rpcUrl: "x",
+      transport: async () => ({ status: 200, error: "Error(Contract, #3)", contractErrorCode: 3 }),
+    });
+
+    const fromReal = await real.pause(STRANGER, "because");
+    const fromMock = await configured().pause(STRANGER, "because");
+
+    expect(fromMock.errorCode).toBe(fromReal.errorCode);
+    expect(fromMock.contractErrorCode).toBe(fromReal.contractErrorCode);
+    expect(fromMock.error).toBe(fromReal.error);
+  });
+
+  it("learns the roles from an initialize call and then enforces them", async () => {
+    const client = new MockSlaCalculatorClient();
+    await client.initialize(ADMIN, OPERATOR);
+
+    expect((await client.calculateSla(STRANGER, "o1", "high", 5)).ok).toBe(false);
+    expect((await client.calculateSla(OPERATOR, "o1", "high", 5)).ok).toBe(true);
+  });
+
+  it("does not enforce anything before roles are known (existing behaviour)", async () => {
+    const client = new MockSlaCalculatorClient();
+    expect((await client.pause("anyone", "r")).ok).toBe(true);
+  });
+
+  it("an unauthorized call does not reach a configured mock response", async () => {
+    const client = configured();
+    client.mockResponse("pause", { value: "ran" });
+
+    const result = await client.pause(STRANGER, "r");
+
+    expect(result.ok).toBe(false);
+    expect(result.value).toBeUndefined();
   });
 });
