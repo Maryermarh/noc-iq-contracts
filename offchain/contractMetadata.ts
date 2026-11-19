@@ -57,3 +57,40 @@ console.log("[SC-019] Contract metadata introspection:");
 const metadata = parseMetadata(rawResponse);
 validateMetadata(metadata);
 console.log("Metadata introspection passed.");
+
+// ---------------------------------------------------------------------------
+// #1054: release manifest network check
+// ---------------------------------------------------------------------------
+
+export type ReleaseNetwork = "mainnet" | "testnet" | "futurenet";
+
+const RELEASE_NETWORKS: readonly string[] = ["mainnet", "testnet", "futurenet"];
+
+/** The fields of a release manifest this check reads. */
+export interface ReleaseManifest {
+  network?: unknown;
+}
+
+export class NetworkMismatchError extends Error {
+  constructor(
+    public readonly expected: ReleaseNetwork,
+    /** The manifest's network id, or a placeholder when it was missing or not a known id. */
+    public readonly actual: string
+  ) {
+    super(`[SC-019] Release manifest targets network "${actual}" but this release targets "${expected}"`);
+    this.name = "NetworkMismatchError";
+  }
+}
+
+/**
+ * Rejects a release manifest that names a different network than the release target. Run it
+ * before any deployment or invocation: a matching artifact hash is not enough. Only network
+ * identifiers appear in the error; any other manifest content, and anything that is not a known
+ * network id, is replaced by a placeholder so secrets cannot leak through a diagnostic.
+ */
+export function assertManifestNetwork(manifest: ReleaseManifest, expected: ReleaseNetwork): void {
+  const raw = manifest.network;
+  if (raw === undefined || raw === null || raw === "") throw new NetworkMismatchError(expected, "<missing>");
+  if (typeof raw !== "string" || !RELEASE_NETWORKS.includes(raw)) throw new NetworkMismatchError(expected, "<unrecognized>");
+  if (raw !== expected) throw new NetworkMismatchError(expected, raw);
+}
