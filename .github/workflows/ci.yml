@@ -62,3 +62,71 @@ jobs:
           if [ "$SIZE" -gt "$MAX" ]; then
             echo "::warning::Contract binary (${SIZE}B) exceeds soft limit of ${MAX}B"
           fi
+
+      # #1093 — generated SDK bindings must be committed and current
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Verify generated type bindings are current
+        working-directory: sdk
+        run: |
+          npm install --no-audit --no-fund
+          npm run generate:types
+          CHANGED=$( (git diff --name-only -- src; git ls-files --others --exclude-standard -- src) | sort -u )
+          if [ -n "$CHANGED" ]; then
+            echo "::error::Generated bindings are out of date. Run 'cd sdk && npm run generate:types' and commit these files:"
+            echo "$CHANGED"
+            git --no-pager diff -- src
+            exit 1
+          fi
+          echo "Generated bindings are current."
+
+  # #1092 — decide whether deployment helper scripts changed
+  changes:
+    name: Detect deployment script changes
+    runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.filter.outputs.deploy }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: filter
+        run: |
+          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
+          # No usable base (new branch / first push): run the tests.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$BASE" HEAD | grep -E '^(scripts/deploy-[^/]*\.sh|scripts/pre-deploy-verify\.ts|\.github/workflows/ci\.yml)$'; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy-script-tests:
+    name: Deployment script tests
+    needs: changes
+    if: needs.changes.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run deploy-multi-network.test.sh
+        run: |
+          set -o pipefail
+          chmod +x scripts/deploy-multi-network.sh scripts/deploy-multi-network.test.sh
+          bash scripts/deploy-multi-network.test.sh 2>&1 | tee deploy-script-tests.log
+
+      # Preserve logs even when the simulation fails and blocks the workflow.
+      - name: Upload deployment test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-script-test-logs
+          path: deploy-script-tests.log
+          retention-days: 14

@@ -106,3 +106,46 @@ Before marking a PR ready for Wave review, confirm:
 | WASM size over budget | Optimize or justify in PR description |
 | No issue reference in commit | Amend commit with `SC-W5-xxx` reference |
 | Snapshot tests not updated | Run `cargo test` after logic changes |
+
+---
+
+## 9. Local Release-Gate Workflow (in order)
+
+Run these from the repository root, in this order, to mirror the checks that
+block a deployment. Replace the placeholders in `<...>` with your values; no
+private keys are needed for any step.
+
+```bash
+# 1. Type generation — regenerate and confirm no uncommitted diff
+(cd sdk && npm install --no-audit --no-fund && npm run generate:types)
+git diff --exit-code -- sdk/src
+
+# 2. Tests
+cargo test --manifest-path sla_calculator/Cargo.toml
+cargo check --manifest-path sla_calculator/Cargo.toml --target wasm32-unknown-unknown --lib
+(cd sdk && npm test)
+
+# 3. WASM size (artifact must be where the script expects it)
+CARGO_TARGET_DIR=sla_calculator/target cargo build --manifest-path sla_calculator/Cargo.toml --target wasm32-unknown-unknown --release
+npx ts-node scripts/check-wasm-size.ts
+
+# 4. Security gate (scans staged .rs files)
+git add <changed .rs files>
+npx ts-node scripts/security-gate.ts
+
+# 5. Deployment checks
+bash scripts/deploy-multi-network.test.sh
+npx ts-node scripts/pre-deploy-verify.ts
+./scripts/deploy-testnet.sh --admin <ADMIN_PUBLIC_ADDRESS> --dry-run
+```
+
+Notes:
+
+- `scripts/pre-deploy-verify.ts` expects `sla_calculator/manifest.sha256` and
+  the WASM at `sla_calculator/target/wasm32-unknown-unknown/release/sla_calculator.wasm`
+  (the same location step 3 builds into); it fails if either is missing.
+- The deploy script step is a `--dry-run`: it prints the planned actions and
+  never calls `stellar-cli`.
+- CI runs a subset of these (formatting, clippy, tests, wasm32 build, size
+  report, the generated-bindings check, and the deployment script tests when
+  deployment helpers change); the full sequence above is the stricter local version.
