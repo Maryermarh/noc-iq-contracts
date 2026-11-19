@@ -1,9 +1,26 @@
-use soroban_sdk::{contracttype, symbol_short, Env, Map, String, Symbol};
+use soroban_sdk::{contracttype, symbol_short, Env, Map, String, Symbol, Vec};
 
 pub const COMPACTED_EVENT: Symbol = symbol_short!("compact");
 pub const SUMMARY_BYTES: u32 = 32;
 pub const SUMMARY_KEY: Symbol = symbol_short!("osum");
 pub const DETAIL_KEY: Symbol = symbol_short!("odtl");
+pub const PROGRESS_KEY: Symbol = symbol_short!("ocprog");
+
+/// Committed progress of a resumable compaction run. Each call commits its
+/// progress atomically with the records it handled, so a rerun after an
+/// interruption continues from `next_index` and never revisits (or
+/// re-publishes events for) records that were already committed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub struct CompactionProgress {
+    /// Records ending before this timestamp are compacted; newer ones are left untouched.
+    pub cutoff: u64,
+    /// Index into the supplied record list of the next record to examine.
+    pub next_index: u32,
+    /// Number of records compacted so far in this run.
+    pub compacted: u32,
+    pub complete: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[contracttype]
@@ -103,6 +120,64 @@ pub fn compact_outage(env: &Env, record: &DetailedOutageRecord) -> OutageSummary
     summary
 }
 
+pub fn load_progress(env: &Env) -> Option<CompactionProgress> {
+    env.storage().persistent().get(&PROGRESS_KEY)
+}
+
+/// Compacts an outage only if it has not already been compacted (a summary
+/// exists and the verbose record is gone), so reruns stay idempotent and do
+/// not publish duplicate compaction events.
+fn compact_outage_once(env: &Env, record: &DetailedOutageRecord) -> bool {
+    if load_summary(env, &record.outage_id).is_some() && load_detailed(env, &record.outage_id).is_none()
+    {
+        return false;
+    }
+    compact_outage(env, record);
+    true
+}
+
+/// Resumable compaction. Examines at most `max_per_call` records starting at
+/// the committed cursor, compacts those that ended before `cutoff`, leaves
+/// newer records (and their summaries/indexes) untouched, and commits the
+/// cursor. Calling it again with the same `cutoff` continues where the last
+/// committed call stopped; calling it after completion is a no-op. A
+/// different `cutoff` starts a fresh run.
+pub fn compact_resumable(
+    env: &Env,
+    records: &Vec<DetailedOutageRecord>,
+    cutoff: u64,
+    max_per_call: u32,
+) -> CompactionProgress {
+    let mut progress = match load_progress(env) {
+        Some(p) if p.cutoff == cutoff => p,
+        _ => CompactionProgress {
+            cutoff,
+            next_index: 0,
+            compacted: 0,
+            complete: false,
+        },
+    };
+    if progress.complete {
+        return progress;
+    }
+
+    let mut handled: u32 = 0;
+    while progress.next_index < records.len() && handled < max_per_call {
+        if let Some(record) = records.get(progress.next_index) {
+            if record.end_timestamp < cutoff && compact_outage_once(env, &record) {
+                progress.compacted += 1;
+            }
+        }
+        progress.next_index += 1;
+        handled += 1;
+    }
+    if progress.next_index >= records.len() {
+        progress.complete = true;
+    }
+    env.storage().persistent().set(&PROGRESS_KEY, &progress);
+    progress
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +273,104 @@ mod tests {
             evict_details(&env, &Symbol::new(&env, "OUT9"))
         });
         assert!(!evicted);
+    }
+    fn record_at(env: &Env, id: &str, end: u64) -> DetailedOutageRecord {
+        DetailedOutageRecord {
+            outage_id: Symbol::new(env, id),
+            start_timestamp: end - 100,
+            end_timestamp: end,
+            severity: 2,
+            description: String::from_str(env, "outage"),
+            metadata: String::from_str(env, "meta"),
+        }
+    }
+
+    fn five_records(env: &Env) -> Vec<DetailedOutageRecord> {
+        let mut v: Vec<DetailedOutageRecord> = Vec::new(env);
+        // OUT1..OUT3 are older than the cutoff (1_000); OUT4 and OUT5 are recent.
+        v.push_back(record_at(env, "OUT1", 500));
+        v.push_back(record_at(env, "OUT2", 600));
+        v.push_back(record_at(env, "OUT3", 700));
+        v.push_back(record_at(env, "OUT4", 2_000));
+        v.push_back(record_at(env, "OUT5", 3_000));
+        v
+    }
+
+    #[test]
+    fn interrupted_compaction_resumes_from_committed_progress() {
+        let env = Env::default();
+        env.as_contract(&contract(&env), || {
+            let records = five_records(&env);
+            for i in 0..records.len() {
+                store_detailed(&env, &records.get(i).unwrap());
+            }
+
+            // First call commits two records and then "dies" (returns early).
+            let first = compact_resumable(&env, &records, 1_000, 2);
+            assert!(!first.complete);
+            assert_eq!(first.next_index, 2);
+            assert_eq!(first.compacted, 2);
+            assert!(load_summary(&env, &Symbol::new(&env, "OUT3")).is_none());
+
+            // Rerun finishes without redoing OUT1/OUT2.
+            let second = compact_resumable(&env, &records, 1_000, 10);
+            assert!(second.complete);
+            assert_eq!(second.compacted, 3);
+            for id in ["OUT1", "OUT2", "OUT3"] {
+                let sym = Symbol::new(&env, id);
+                assert!(load_summary(&env, &sym).is_some());
+                assert!(load_detailed(&env, &sym).is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn recent_records_are_left_queryable() {
+        let env = Env::default();
+        env.as_contract(&contract(&env), || {
+            let records = five_records(&env);
+            for i in 0..records.len() {
+                store_detailed(&env, &records.get(i).unwrap());
+            }
+            compact_resumable(&env, &records, 1_000, 100);
+            for id in ["OUT4", "OUT5"] {
+                let sym = Symbol::new(&env, id);
+                assert!(load_detailed(&env, &sym).is_some());
+                assert!(load_summary(&env, &sym).is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn rerunning_a_completed_compaction_is_idempotent() {
+        let env = Env::default();
+        env.as_contract(&contract(&env), || {
+            let records = five_records(&env);
+            for i in 0..records.len() {
+                store_detailed(&env, &records.get(i).unwrap());
+            }
+            let done = compact_resumable(&env, &records, 1_000, 100);
+            assert!(done.complete);
+            let again = compact_resumable(&env, &records, 1_000, 100);
+            assert_eq!(done, again);
+            assert_eq!(load_progress(&env), Some(again));
+        });
+    }
+
+    #[test]
+    fn a_different_cutoff_starts_a_fresh_run() {
+        let env = Env::default();
+        env.as_contract(&contract(&env), || {
+            let records = five_records(&env);
+            for i in 0..records.len() {
+                store_detailed(&env, &records.get(i).unwrap());
+            }
+            compact_resumable(&env, &records, 1_000, 100);
+            let wider = compact_resumable(&env, &records, 2_500, 100);
+            assert!(wider.complete);
+            // Only OUT4 is newly compacted; OUT1..OUT3 were already done.
+            assert_eq!(wider.compacted, 1);
+            assert!(load_detailed(&env, &Symbol::new(&env, "OUT5")).is_some());
+        });
     }
 }
