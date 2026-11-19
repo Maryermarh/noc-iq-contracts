@@ -10,8 +10,49 @@ const WASM_PATH = path.resolve(
   "sla_calculator/target/wasm32-unknown-unknown/release/sla_calculator.wasm"
 );
 
-// Hard budget in bytes. Raise via PR with documented justification.
-const SIZE_BUDGET_BYTES = 100 * 1024; // 100 KB
+// Fallback budget in bytes, used only when .wasm-budget is absent.
+const DEFAULT_BUDGET_BYTES = 100 * 1024; // 100 KB
+const BUDGET_FILE = path.resolve(".wasm-budget");
+export const BUILD_COMMAND =
+  "cargo build --target wasm32-unknown-unknown --release -p sla_calculator";
+
+/** Reads MAX_WASM_BYTES from a `.wasm-budget` file; falls back to the default. */
+export function readBudget(file: string = BUDGET_FILE): number {
+  try {
+    const m = /^\s*MAX_WASM_BYTES\s*=\s*(\d+)\s*$/m.exec(fs.readFileSync(file, "utf8"));
+    if (m) return parseInt(m[1], 10);
+  } catch {
+    /* fall through */
+  }
+  return DEFAULT_BUDGET_BYTES;
+}
+
+export interface SizeVerdict {
+  ok: boolean;
+  message: string;
+}
+
+/**
+ * Pure size gate: an artifact exactly at the budget passes, one byte over
+ * fails, and a missing artifact (size === null) always fails with the
+ * expected path and the command that produces it.
+ */
+export function evaluateSize(
+  size: number | null,
+  budget: number,
+  wasmPath: string = WASM_PATH,
+): SizeVerdict {
+  if (size === null) {
+    return {
+      ok: false,
+      message: `WASM artifact missing at ${wasmPath}. Build it first with: ${BUILD_COMMAND}`,
+    };
+  }
+  if (size > budget) {
+    return { ok: false, message: `WASM size ${size} B exceeds budget ${budget} B (over by ${size - budget} B)` };
+  }
+  return { ok: true, message: `WASM size ${size} B within budget ${budget} B` };
+}
 
 // Baseline snapshot file — updated by maintainers on intentional size changes.
 const BASELINE_FILE = path.resolve("sla_calculator/.wasm-size-baseline");
@@ -30,11 +71,12 @@ function formatKB(bytes: number): string {
 
 function checkSize(): void {
   if (!fs.existsSync(WASM_PATH)) {
-    console.error(`❌ WASM not found at ${WASM_PATH}. Run: cargo build --target wasm32-unknown-unknown --release`);
+    console.error(`❌ ${evaluateSize(null, 0).message}`);
     process.exit(1);
   }
 
   const { size } = fs.statSync(WASM_PATH);
+  const SIZE_BUDGET_BYTES = readBudget();
   const baseline = readBaseline();
 
   console.log(`WASM size : ${formatKB(size)}`);
@@ -59,4 +101,6 @@ function checkSize(): void {
   console.log("✅ WASM size within budget.");
 }
 
-checkSize();
+if (require.main === module) {
+  checkSize();
+}

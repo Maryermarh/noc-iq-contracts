@@ -19,6 +19,11 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import { execSync } from "child_process";
+import {
+  buildReleaseMetadata,
+  serializeReleaseMetadata,
+  readSorobanSdkVersion,
+} from "./release-metadata";
 
 const WASM_PATH = path.resolve(
   "sla_calculator/target/wasm32-unknown-unknown/release/sla_calculator.wasm"
@@ -140,20 +145,33 @@ function buildEvidencePackage(): void {
   }
 
   // 9. Generate metadata JSON
-  const metadata = {
+  let fullSha = sha;
+  try {
+    fullSha = execSync("git rev-parse HEAD", { encoding: "utf8" }).trim();
+  } catch {
+    /* keep short sha */
+  }
+  let lockText = "";
+  try {
+    lockText = fs.readFileSync(path.resolve("Cargo.lock"), "utf8");
+  } catch {
+    /* sdk version reported as unknown */
+  }
+  const metadata = buildReleaseMetadata({
+    commit: fullSha,
     tag,
-    sha,
+    rustVersion: runCommand("rustc --version", "Rust version").trim(),
+    cargoVersion: runCommand("cargo --version", "Cargo version").trim(),
+    sorobanSdk: readSorobanSdkVersion(lockText),
+    buildTarget: "wasm32-unknown-unknown",
+    buildProfile: "release",
+    wasmSha256: hash,
+    wasmSizeBytes: wasmSize,
     timestamp,
-    wasm_size_bytes: wasmSize,
-    wasm_sha256: hash,
-    rust_version: runCommand("rustc --version", "Rust version").trim(),
-    cargo_version: runCommand("cargo --version", "Cargo version").trim(),
-    build_target: "wasm32-unknown-unknown",
-    build_profile: "release",
-  };
+  });
   fs.writeFileSync(
     path.join(evidenceDir, "metadata.json"),
-    JSON.stringify(metadata, null, 2)
+    serializeReleaseMetadata(metadata)
   );
   console.log("✅ Metadata JSON generated");
 
@@ -177,4 +195,6 @@ function buildEvidencePackage(): void {
   console.log("\n✅ Release evidence package built successfully.\n");
 }
 
-buildEvidencePackage();
+if (require.main === module) {
+  buildEvidencePackage();
+}

@@ -24,18 +24,73 @@ const WASM_PATH = path.resolve(
 const MANIFEST_PATH = path.resolve("sla_calculator/manifest.sha256");
 const SIZE_BUDGET = 100 * 1024;
 
+export const NETWORK_PASSPHRASES: Record<string, string> = {
+  TESTNET: "Test SDF Network ; September 2015",
+  MAINNET: "Public Global Stellar Network ; September 2015",
+};
+
+/** Network identity declared in the artifact's build metadata. */
+export interface ArtifactMetadata {
+  target_network?: string;
+}
+
+export interface DeployTarget {
+  network?: string;
+  passphrase?: string;
+}
+
+/**
+ * Compares the configured deploy target with the network recorded in the
+ * artifact metadata (and the passphrase expected for that network). Only
+ * network names/passphrases are read or printed — never key material.
+ */
+export function checkNetworkIdentity(
+  target: DeployTarget,
+  meta: ArtifactMetadata | null,
+): VerifyResult {
+  const check = "Configured network matches artifact metadata";
+  const configured = target.network?.toUpperCase();
+  if (!configured) {
+    return { check, passed: false, detail: "No target network configured. Set DEPLOY_NETWORK=TESTNET|MAINNET or pass --network." };
+  }
+  if (!(configured in NETWORK_PASSPHRASES)) {
+    return { check, passed: false, detail: `Unknown network '${configured}'. Expected one of: ${Object.keys(NETWORK_PASSPHRASES).join(", ")}.` };
+  }
+  if (target.passphrase && target.passphrase !== NETWORK_PASSPHRASES[configured]) {
+    return { check, passed: false, detail: `Passphrase does not belong to ${configured}. Expected '${NETWORK_PASSPHRASES[configured]}' but got '${target.passphrase}'.` };
+  }
+  const declared = meta?.target_network?.toUpperCase();
+  if (!declared) {
+    return { check, passed: false, detail: "Artifact metadata has no target_network. Rebuild and write it to sla_calculator/build-metadata.json." };
+  }
+  if (declared !== configured) {
+    return { check, passed: false, detail: `Network mismatch: deploy configured for ${configured} but artifact was built for ${declared}. Rebuild for ${configured} or change DEPLOY_NETWORK.` };
+  }
+  return { check, passed: true, detail: configured };
+}
+
 function sha256File(filePath: string): string {
   const data = fs.readFileSync(filePath);
   return crypto.createHash("sha256").update(data).digest("hex");
 }
 
-interface VerifyResult {
+export interface VerifyResult {
   check: string;
   passed: boolean;
   detail: string;
 }
 
-export function verifyPreDeploy(): VerifyResult[] {
+const METADATA_PATH = path.resolve("sla_calculator/build-metadata.json");
+
+function readArtifactMetadata(): ArtifactMetadata | null {
+  try {
+    return JSON.parse(fs.readFileSync(METADATA_PATH, "utf8")) as ArtifactMetadata;
+  } catch {
+    return null;
+  }
+}
+
+export function verifyPreDeploy(target: DeployTarget = {}): VerifyResult[] {
   const results: VerifyResult[] = [];
 
   // 1. WASM exists
@@ -78,6 +133,19 @@ export function verifyPreDeploy(): VerifyResult[] {
     });
   }
 
+  // 3b. Network identity (only when a target is configured)
+  if (target.network !== undefined || process.env.DEPLOY_NETWORK) {
+    results.push(
+      checkNetworkIdentity(
+        {
+          network: target.network ?? process.env.DEPLOY_NETWORK,
+          passphrase: target.passphrase ?? process.env.DEPLOY_NETWORK_PASSPHRASE,
+        },
+        readArtifactMetadata(),
+      ),
+    );
+  }
+
   // 4. Artifact is not a zero-byte stub
   results.push({
     check: "WASM is non-empty",
@@ -90,7 +158,10 @@ export function verifyPreDeploy(): VerifyResult[] {
 
 if (require.main === module) {
   console.log("=== Pre-Deploy Metadata Verification ===\n");
-  const results = verifyPreDeploy();
+  const netIdx = process.argv.indexOf("--network");
+  const results = verifyPreDeploy(
+    netIdx !== -1 ? { network: process.argv[netIdx + 1] } : {},
+  );
   for (const r of results) {
     console.log(`${r.passed ? "✅" : "❌"} ${r.check}: ${r.detail}`);
   }
