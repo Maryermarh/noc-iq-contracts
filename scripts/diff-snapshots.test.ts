@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { flatten, classifyDiff } from "./diff-snapshots";
+import { flatten, classifyDiff, findMissingSnapshots, unifiedDiff } from "./diff-snapshots";
 
 describe("flatten", () => {
   it("flattens nested objects with dot-separated keys", () => {
@@ -61,5 +61,32 @@ describe("classifyDiff", () => {
 
     expect(result.volatileChanges).toEqual(["meta.generated_at"]);
     expect(result.semanticChanges).toEqual([]);
+  });
+});
+
+describe("findMissingSnapshots", () => {
+  it("lists expected snapshots that are absent", () => {
+    expect(findMissingSnapshots(["b.json", "a.json", "c.json"], new Set(["a.json"]))).toEqual([
+      "b.json",
+      "c.json",
+    ]);
+  });
+
+  it("returns nothing when all are present", () => {
+    expect(findMissingSnapshots(["a.json"], new Set(["a.json"]))).toEqual([]);
+  });
+});
+
+describe("unifiedDiff", () => {
+  it("returns an empty string for identical content", () => {
+    expect(unifiedDiff("x\ny", "x\ny")).toBe("");
+  });
+
+  it("produces a reviewable diff for an intentional update", () => {
+    const d = unifiedDiff('{\n  "a": 1\n}', '{\n  "a": 2\n}', "old", "new");
+    expect(d).toContain("--- old");
+    expect(d).toContain("+++ new");
+    expect(d).toContain('-  "a": 1');
+    expect(d).toContain('+  "a": 2');
   });
 });

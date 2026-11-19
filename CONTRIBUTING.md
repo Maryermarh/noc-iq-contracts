@@ -458,6 +458,7 @@ cargo test -- --nocapture
 
 - **Never commit secrets** (API keys, private keys, passwords)
 - Use **environment variables** for sensitive data
+- `scripts/invoke-examples.ts` redacts secret seeds from logged commands and failures; still prefer a stellar-cli identity name over a raw secret for `SOURCE_ACCOUNT`
 - Follow **principle of least privilege**
 - **Validate all inputs**
 - Use **prepared statements** for database queries
