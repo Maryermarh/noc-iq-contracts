@@ -11,6 +11,24 @@
 export interface TypeGenField {
   name: string;
   tsType: string;
+  /**
+   * The key/argument may be omitted entirely (`name?: T`). Distinct from
+   * `nullable`: an omitted value is `undefined`, not `null`.
+   */
+  optional?: boolean;
+  /**
+   * The value is present but may be `null` (`T | null`), matching a
+   * Soroban `Option<T>` that decodes to `null`.
+   */
+  nullable?: boolean;
+}
+
+function fieldType(f: TypeGenField): string {
+  return f.nullable ? `${f.tsType} | null` : f.tsType;
+}
+
+function fieldDecl(f: TypeGenField): string {
+  return `${f.name}${f.optional ? "?" : ""}: ${fieldType(f)}`;
 }
 
 export interface TypeGenStruct {
@@ -117,7 +135,7 @@ export function generateTypeDefinitions(spec: TypeGenSpec): string {
   for (const struct of structs) {
     lines.push(`export interface ${struct.name} {`);
     for (const field of struct.fields) {
-      lines.push(`  ${field.name}: ${field.tsType};`);
+      lines.push(`  ${fieldDecl(field)};`);
     }
     lines.push("}", "");
   }

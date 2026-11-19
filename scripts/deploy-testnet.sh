@@ -140,6 +140,20 @@ if [[ "$DRY_RUN" == "false" ]]; then
         log_error "WASM not found at $WASM_PATH"
         exit 1
     fi
+    # Refuse a stale artifact: any contract source newer than the built
+    # WASM means the binary does not match the checked-out code.
+    STALE_SRC=$(find sla_calculator/src sla_calculator/Cargo.toml Cargo.toml Cargo.lock \
+        -type f -newer "$WASM_PATH" 2>/dev/null | head -n1 || true)
+    if [[ -n "$STALE_SRC" ]]; then
+        log_error "Stale WASM: $STALE_SRC is newer than $WASM_PATH. Rebuild before deploying."
+        exit 1
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        WASM_SHA256=$(sha256sum "$WASM_PATH" | awk '{print $1}')
+    else
+        WASM_SHA256=$(shasum -a 256 "$WASM_PATH" | awk '{print $1}')
+    fi
+    log_info "  WASM sha256: $WASM_SHA256"
     stellar contract optimize --wasm "$WASM_PATH"
     OPTIMIZED_PATH="${WASM_PATH%.wasm}.optimized.wasm"
     log_success "WASM optimized: $OPTIMIZED_PATH"
@@ -158,7 +172,7 @@ if [[ "$DRY_RUN" == "false" ]]; then
         --rpc-url "https://soroban-${NETWORK,,}.stellar.org" \
         --network-passphrase "$NETWORK_PASSPHRASE" \
         2>&1 | tee /dev/stderr | grep -oP 'Contract ID: \K[a-zA-Z0-9]+')
-    log_success "Contract deployed: $CONTRACT_ID"
+    log_success "Contract deployed: $CONTRACT_ID (wasm sha256: ${WASM_SHA256:-unknown})"
 else
     CONTRACT_ID="C_PLACEHOLDER_1234567890ABCDEF"
     log_info "  [DRY RUN] Would deploy: $OPTIMIZED_PATH"
@@ -204,6 +218,7 @@ log_info "Contract ID: $CONTRACT_ID"
 log_info "Network:     $NETWORK"
 log_info "Admin:       $ADMIN"
 log_info "Operator:    $OPERATOR"
+log_info "WASM sha256: ${WASM_SHA256:-n/a (dry run)}"
 echo ""
 log_info "Next steps:"
 log_info "  1. Save the contract ID for backend configuration"

@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import {
   SLACalculatorClient,
   TimeoutError,
+  extractRequestId,
   decodeContractEvent,
   TransactionStatusResult,
 } from "../src/client";
