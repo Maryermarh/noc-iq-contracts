@@ -138,6 +138,8 @@ pub const EVENT_OP_ACC: Symbol = symbol_short!("op_acc");
 pub const EVENT_OP_CAN: Symbol = symbol_short!("op_can");
 #[allow(dead_code)]
 pub const EVENT_SLA_VIOLATED: Symbol = symbol_short!("sla_viol"); // #594
+/// #1033 — emitted when evidence is rejected after adjudication begins.
+pub const EVENT_EVIDENCE_REJECTED: Symbol = symbol_short!("ev_rej");
 #[allow(dead_code)]
 pub const EVENT_SLA_MET: Symbol = symbol_short!("sla_met"); // #595
 

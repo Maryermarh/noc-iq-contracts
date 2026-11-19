@@ -13,6 +13,8 @@ use soroban_sdk::{contracterror, symbol_short, Address, BytesN, Env, Symbol};
 // -----------------------------------------------------------------------
 const DISPUTES_KEY: Symbol = symbol_short!("DISP");
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
+/// #1034 — the address authorised to finalise disputes.
+const ARBITRATOR_KEY: Symbol = symbol_short!("ARBITR");
 /// Issue #722: per-arbitrator accumulated fee balance across all disputes.
 const ARB_FEES_KEY: Symbol = symbol_short!("ARBFEE");
 /// Issue #720: settlement payout record per dispute.
@@ -115,6 +117,15 @@ impl DisputeStatus {
             DisputeStatus::Open | DisputeStatus::UnderReview | DisputeStatus::Escalated
         )
     }
+}
+
+/// #1033 — adjudication begins once the dispute is under review or escalated.
+/// From that point the evidence record must be stable for voters.
+pub fn adjudication_started(status: &DisputeStatus) -> bool {
+    matches!(
+        status,
+        DisputeStatus::UnderReview | DisputeStatus::Escalated
+    )
 }
 
 /// Dispute escalation level.
@@ -405,6 +416,11 @@ pub fn add_dispute_evidence(
     if !dispute.status.is_active() {
         return Err(DisputeError::DisputeNotActive);
     }
+    // #1033 — evidence becomes immutable once adjudication starts so the
+    // final decision is based on the digest that was filed.
+    if adjudication_started(&dispute.status) {
+        return Err(DisputeError::InvalidTransition);
+    }
 
     dispute
         .evidence_history
@@ -636,7 +652,7 @@ pub fn resolve_dispute(
     resolution: soroban_sdk::String,
     upheld: bool,
 ) -> Result<SettlementPayout, DisputeError> {
-    require_admin(env, caller)?;
+    require_admin_or_arbitrator(env, caller)?;
 
     let disputes = load_disputes(env);
 
@@ -961,6 +977,39 @@ fn load_payouts(env: &Env) -> soroban_sdk::Map<Symbol, SettlementPayout> {
         .instance()
         .get(&PAYOUTS_KEY)
         .unwrap_or_else(|| soroban_sdk::Map::new(env))
+}
+
+/// #1034 — configure the address authorised to finalise disputes (admin only).
+pub fn set_arbitrator(
+    env: &Env,
+    admin: &Address,
+    arbitrator: &Address,
+) -> Result<(), DisputeError> {
+    require_admin(env, admin)?;
+    env.storage().instance().set(&ARBITRATOR_KEY, arbitrator);
+    Ok(())
+}
+
+/// Whether `address` is the configured arbitrator.
+pub fn is_arbitrator(env: &Env, address: &Address) -> bool {
+    env.storage()
+        .instance()
+        .get::<_, Address>(&ARBITRATOR_KEY)
+        .map(|arbitrator| arbitrator == *address)
+        .unwrap_or(false)
+}
+
+/// #1034 — finalisation is restricted to the configured arbitrator or the
+/// governance (admin) path. A filer, provider or unrelated address must not
+/// be able to set a final state or emit a decision event.
+pub fn require_admin_or_arbitrator(
+    env: &Env,
+    caller: &Address,
+) -> Result<(), DisputeError> {
+    if is_arbitrator(env, caller) {
+        return Ok(());
+    }
+    require_admin(env, caller)
 }
 
 /// Helper to verify admin role.
