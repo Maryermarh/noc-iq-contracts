@@ -124,6 +124,34 @@ pub fn load_progress(env: &Env) -> Option<CompactionProgress> {
     env.storage().persistent().get(&PROGRESS_KEY)
 }
 
+/// #1026 — an event exactly on the retention cutoff is retained.
+///
+/// Defining the boundary as inclusive removes the ambiguity for events whose
+/// timestamp equals the cutoff: they are never compacted, so the newest event
+/// and the correlation references pointing at it stay queryable.
+pub fn is_retained_at_boundary(timestamp: u64, cutoff: u64) -> bool {
+    timestamp >= cutoff
+}
+
+/// Newest retained outage id (and therefore its correlation reference) for
+/// the given cutoff, or `None` when every record is older than the cutoff.
+pub fn newest_retained_reference(
+    records: &Vec<DetailedOutageRecord>,
+    cutoff: u64,
+) -> Option<Symbol> {
+    let mut newest: Option<(u64, Symbol)> = None;
+    for record in records.iter() {
+        if !is_retained_at_boundary(record.end_timestamp, cutoff) {
+            continue;
+        }
+        match newest {
+            Some((at, _)) if at >= record.end_timestamp => {}
+            _ => newest = Some((record.end_timestamp, record.outage_id.clone())),
+        }
+    }
+    newest.map(|(_, id)| id)
+}
+
 /// Compacts an outage only if it has not already been compacted (a summary
 /// exists and the verbose record is gone), so reruns stay idempotent and do
 /// not publish duplicate compaction events.
@@ -164,7 +192,9 @@ pub fn compact_resumable(
     let mut handled: u32 = 0;
     while progress.next_index < records.len() && handled < max_per_call {
         if let Some(record) = records.get(progress.next_index) {
-            if record.end_timestamp < cutoff && compact_outage_once(env, &record) {
+            if !is_retained_at_boundary(record.end_timestamp, cutoff)
+                && compact_outage_once(env, &record)
+            {
                 progress.compacted += 1;
             }
         }
@@ -371,6 +401,68 @@ mod tests {
             // Only OUT4 is newly compacted; OUT1..OUT3 were already done.
             assert_eq!(wider.compacted, 1);
             assert!(load_detailed(&env, &Symbol::new(&env, "OUT5")).is_some());
+        });
+    }
+}
+
+#[cfg(test)]
+mod retention_boundary_tests {
+    use super::*;
+    use soroban_sdk::String;
+
+    fn record(env: &Env, id: &str, end: u64) -> DetailedOutageRecord {
+        DetailedOutageRecord {
+            outage_id: Symbol::new(env, id),
+            start_timestamp: end.saturating_sub(10),
+            end_timestamp: end,
+            severity: 1,
+            description: String::from_str(env, "desc"),
+            metadata: String::from_str(env, "meta"),
+        }
+    }
+
+    #[test]
+    fn boundary_is_inclusive() {
+        assert!(!is_retained_at_boundary(99, 100));
+        assert!(is_retained_at_boundary(100, 100));
+        assert!(is_retained_at_boundary(101, 100));
+    }
+
+    #[test]
+    fn newest_event_at_the_exact_cutoff_stays_queryable() {
+        let env = Env::default();
+        let records = Vec::from_array(
+            &env,
+            [
+                record(&env, "OLD", 50),
+                record(&env, "BOUNDARY", 100),
+                record(&env, "NEW", 150),
+            ],
+        );
+
+        assert_eq!(
+            newest_retained_reference(&records, 100),
+            Some(Symbol::new(&env, "NEW"))
+        );
+        assert_eq!(
+            newest_retained_reference(&records, 200),
+            Some(Symbol::new(&env, "NEW"))
+        );
+    }
+
+    #[test]
+    fn an_event_exactly_on_the_cutoff_is_not_compacted() {
+        let env = Env::default();
+        let contract = env.register_contract(None, crate::SLACalculatorContract);
+        env.as_contract(&contract, || {
+            let boundary = record(&env, "BOUNDARY", 100);
+            store_detailed(&env, &boundary);
+            let records = Vec::from_array(&env, [boundary.clone()]);
+            let progress = compact_resumable(&env, &records, 100, 10);
+
+            assert_eq!(progress.compacted, 0);
+            assert!(load_detailed(&env, &boundary.outage_id).is_some());
+            assert!(load_summary(&env, &boundary.outage_id).is_none());
         });
     }
 }

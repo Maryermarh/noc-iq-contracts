@@ -98,11 +98,50 @@ pub fn integrity_check(env: &Env) -> IntegrityReport {
     }
 }
 
-/// #1037 — a duplicate lock identifier is only acceptable when the amount
-/// is identical to the original entry; a different amount would corrupt the
-/// accounting total.
-pub fn duplicate_lock_amount_allowed(existing_amount: i128, proposed_amount: i128) -> bool {
-    existing_amount == proposed_amount
+// -----------------------------------------------------------------------
+// #1023 — cross-field invariants for config mutation sequences
+// -----------------------------------------------------------------------
+
+/// A snapshot of the cross-field state that config mutations must preserve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigState {
+    /// Threshold configured by governance, in minutes.
+    pub configured_minutes: u32,
+    /// Threshold actually applied after safety bounds, in minutes.
+    pub effective_minutes: u32,
+    /// Whether configuration changes are frozen.
+    pub frozen: bool,
+    /// Number of pending (not yet applied) revisions.
+    pub pending_revisions: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigInvariantViolation {
+    ConfiguredOutOfBounds,
+    EffectiveOutOfBounds,
+    EffectiveExceedsConfigured,
+    FrozenWithPendingRevision,
+}
+
+/// `update`, `rollback`, `freeze` and `read` operations must all leave the
+/// configuration in a state that satisfies these cross-field invariants.
+pub fn check_config_invariants(state: ConfigState) -> Result<(), ConfigInvariantViolation> {
+    const MIN: u32 = 1;
+    const MAX: u32 = 1440;
+
+    if state.configured_minutes < MIN || state.configured_minutes > MAX {
+        return Err(ConfigInvariantViolation::ConfiguredOutOfBounds);
+    }
+    if state.effective_minutes < MIN || state.effective_minutes > MAX {
+        return Err(ConfigInvariantViolation::EffectiveOutOfBounds);
+    }
+    if state.effective_minutes > state.configured_minutes {
+        return Err(ConfigInvariantViolation::EffectiveExceedsConfigured);
+    }
+    if state.frozen && state.pending_revisions > 0 {
+        return Err(ConfigInvariantViolation::FrozenWithPendingRevision);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

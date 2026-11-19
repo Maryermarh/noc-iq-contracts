@@ -229,6 +229,18 @@ pub fn get_severity_thresholds(env: &Env, severity: &Symbol) -> Result<SeverityT
     })
 }
 
+/// #1017 — read a severity threshold as both the stored configuration and
+/// the effective (safety-bounded) value, so a clamped value is never
+/// mistaken for the value that was actually configured.
+pub fn get_effective_severity_threshold(
+    env: &Env,
+    severity: &Symbol,
+) -> Result<crate::threshold_bounds::EffectiveThreshold, SLAError> {
+    let configured = get_severity_thresholds(env, severity)?.threshold_minutes;
+    crate::threshold_bounds::resolve_effective_threshold(configured)
+        .map_err(|_| SLAError::InvalidThreshold)
+}
+
 #[cfg(test)]
 mod severity_threshold_view_tests {
     use super::*;

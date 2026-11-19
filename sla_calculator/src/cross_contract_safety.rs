@@ -156,6 +156,22 @@ pub fn require_authorized_caller(
     Ok(())
 }
 
+/// Issue #1019 — authenticate the identity of the contract invoking a
+/// callback before any SLA or payment state can be mutated.
+///
+/// A well-formed payload is not sufficient: the calling contract must be on
+/// the authorized registry *and* must prove its identity with a real Soroban
+/// authorization context. Returning an error here guarantees the guarded
+/// entry point never reaches its state writes for an untrusted caller.
+pub fn require_authorized_callback(
+    env: &Env,
+    caller_contract: &Address,
+) -> Result<(), CrossContractSafetyError> {
+    require_authorized_caller(env, caller_contract)?;
+    caller_contract.require_auth();
+    Ok(())
+}
+
 /// Status of a cross-contract call.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -608,5 +624,81 @@ mod tests {
         // Verify compact is smaller
         assert!(compact_size < 104);
         assert_eq!(compact_args.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod callback_identity_tests {
+    use super::*;
+    use soroban_sdk::{contract, contractimpl, testutils::Address as _, Address, Env};
+
+    const STATE_KEY: Symbol = symbol_short!("SLACBST");
+
+    #[contract]
+    struct CallbackHarness;
+
+    #[contractimpl]
+    impl CallbackHarness {
+        pub fn seed(env: Env, admin: Address, allowed: Address) {
+            let mut callers = Map::new(&env);
+            callers.set(allowed, true);
+            env.storage().instance().set(&ADMIN_KEY, &admin);
+            env.storage().instance().set(&AUTHORIZED_CALLERS_KEY, &callers);
+        }
+
+        /// A valid-payload callback: identity is checked before the write.
+        pub fn apply_callback(env: Env, caller_contract: Address, new_state: u32) -> u32 {
+            require_authorized_callback(&env, &caller_contract).unwrap();
+            env.storage().instance().set(&STATE_KEY, &new_state);
+            env.storage().instance().get(&STATE_KEY).unwrap()
+        }
+
+        pub fn state(env: Env) -> u32 {
+            env.storage().instance().get(&STATE_KEY).unwrap_or(0)
+        }
+    }
+
+    fn harness(env: &Env, allowed: &Address) -> CallbackHarnessClient {
+        let admin = Address::generate(env);
+        let client = CallbackHarnessClient::new(env, &env.register_contract(None, CallbackHarness));
+        client.seed(&admin, allowed);
+        client
+    }
+
+    #[test]
+    fn an_allowlisted_caller_with_authorization_applies_the_callback() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let allowed = Address::generate(&env);
+        let client = harness(&env, &allowed);
+
+        assert_eq!(client.apply_callback(&allowed, &42), 42);
+        assert_eq!(client.state(), 42);
+    }
+
+    #[test]
+    fn a_non_allowlisted_caller_is_rejected_before_state_mutation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let allowed = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let client = harness(&env, &allowed);
+
+        assert!(client.try_apply_callback(&stranger, &99).is_err());
+        assert_eq!(client.state(), 0);
+    }
+
+    #[test]
+    fn an_allowlisted_caller_without_authorization_context_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let allowed = Address::generate(&env);
+        let client = harness(&env, &allowed);
+
+        // Drop all mocked authorization: identity can no longer be proven.
+        env.mock_auths(&[]);
+
+        assert!(client.try_apply_callback(&allowed, &7).is_err());
+        assert_eq!(client.state(), 0);
     }
 }

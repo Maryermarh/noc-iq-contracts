@@ -138,8 +138,8 @@ pub const EVENT_OP_ACC: Symbol = symbol_short!("op_acc");
 pub const EVENT_OP_CAN: Symbol = symbol_short!("op_can");
 #[allow(dead_code)]
 pub const EVENT_SLA_VIOLATED: Symbol = symbol_short!("sla_viol"); // #594
-/// #1038 — emitted when an unbonding tranche receives a new amount.
-pub const EVENT_UNBONDING_UPDATED: Symbol = symbol_short!("unbnd_up");
+/// #1033 — emitted when evidence is rejected after adjudication begins.
+pub const EVENT_EVIDENCE_REJECTED: Symbol = symbol_short!("ev_rej");
 #[allow(dead_code)]
 pub const EVENT_SLA_MET: Symbol = symbol_short!("sla_met"); // #595
 
@@ -216,6 +216,29 @@ pub fn ingest_outage_event(env: &Env, event: &OutageEvent) -> Result<(), SLAErro
         .instance()
         .set(&LAST_EVENT_END_KEY, &event.end_timestamp);
 
+    Ok(())
+}
+
+// -----------------------------------------------------------------------
+// #1027 — serialized payload size guard
+// -----------------------------------------------------------------------
+
+/// Maximum serialized size, in bytes, of a single event payload.
+pub const MAX_SERIALIZED_EVENT_PAYLOAD_BYTES: u32 = 200;
+
+/// Reason a serialized event payload size was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadSizeError {
+    TooLarge,
+}
+
+/// Validate a serialized payload size before the state transition that would
+/// emit the event is committed. A payload exactly on the limit is accepted;
+/// one byte over is rejected.
+pub fn validate_serialized_payload_size(size: u32) -> Result<(), PayloadSizeError> {
+    if size > MAX_SERIALIZED_EVENT_PAYLOAD_BYTES {
+        return Err(PayloadSizeError::TooLarge);
+    }
     Ok(())
 }
 

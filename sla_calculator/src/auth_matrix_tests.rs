@@ -83,3 +83,48 @@ mod auth_matrix_tests {
         assert!(result.is_err());
     }
 }
+
+#[cfg(test)]
+mod dispute_finalization_auth_tests {
+    use crate::dispute::{
+        adjudication_started, is_arbitrator, require_admin_or_arbitrator, set_arbitrator,
+        DisputeError, DisputeStatus,
+    };
+    use soroban_sdk::{testutils::Address as _, Address, Env};
+
+    #[test]
+    fn only_the_arbitrator_or_admin_can_finalize() {
+        let env = Env::default();
+        let contract = env.register_contract(None, crate::SLACalculatorContract);
+        let admin = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        let filer = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let unrelated = Address::generate(&env);
+
+        env.as_contract(&contract, || {
+            env.storage()
+                .instance()
+                .set(&crate::ADMIN_KEY, &admin);
+            assert_eq!(set_arbitrator(&env, &admin, &arbitrator), Ok(()));
+            assert!(is_arbitrator(&env, &arbitrator));
+
+            assert_eq!(require_admin_or_arbitrator(&env, &arbitrator), Ok(()));
+            assert_eq!(require_admin_or_arbitrator(&env, &admin), Ok(()));
+            for caller in [&filer, &provider, &unrelated] {
+                assert_eq!(
+                    require_admin_or_arbitrator(&env, caller),
+                    Err(DisputeError::Unauthorized)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn evidence_is_frozen_once_adjudication_begins() {
+        assert!(!adjudication_started(&DisputeStatus::Open));
+        assert!(adjudication_started(&DisputeStatus::UnderReview));
+        assert!(adjudication_started(&DisputeStatus::Escalated));
+        assert!(!adjudication_started(&DisputeStatus::Resolved));
+    }
+}

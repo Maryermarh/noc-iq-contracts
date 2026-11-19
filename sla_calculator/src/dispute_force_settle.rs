@@ -37,6 +37,12 @@ pub fn force_settle_dispute(
     Ok(())
 }
 
+/// #1035 — whether a force-settled dispute has a terminal payout that bars
+/// any further appeal. A non-zero outcome with a released payout is final.
+pub fn terminal_payout_released(outcome: u32, released: bool) -> bool {
+    released && outcome != 0
+}
+
 /// Same as `force_settle_dispute`, but only applies to unsettled disputes.
 pub fn force_settle_unsettled(
     env: &Env,
@@ -103,5 +109,17 @@ mod tests {
             let result = force_settle_unsettled(&env, 1, 0, 1_000, &signers(&env, 3), true);
             assert_eq!(result, Err(ForceSettleError::AlreadySettled));
         });
+    }
+}
+
+#[cfg(test)]
+mod terminal_payout_tests {
+    use super::*;
+
+    #[test]
+    fn a_released_nonzero_outcome_is_terminal() {
+        assert!(terminal_payout_released(1, true));
+        assert!(!terminal_payout_released(1, false));
+        assert!(!terminal_payout_released(0, true));
     }
 }
