@@ -182,6 +182,101 @@ pub fn version_discovery_interfaces(env: &Env) -> Vec<Symbol> {
     ifaces
 }
 
+/// Why a client's schema requirement cannot be met.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientVersionError {
+    /// The client needs a newer storage schema than this contract provides.
+    SchemaTooNew { required: u32, supported: u32 },
+}
+
+/// Checks a client's minimum required storage schema version against the schema this contract
+/// supports. Pure and read-only: call it before any state is touched, so an unsupported client
+/// gets a compatibility error and the contract's state and events are left unchanged.
+pub fn check_client_min_schema(
+    required_min_schema: u32,
+    supported_schema: u32,
+) -> Result<(), ClientVersionError> {
+    if required_min_schema > supported_schema {
+        return Err(ClientVersionError::SchemaTooNew {
+            required: required_min_schema,
+            supported: supported_schema,
+        });
+    }
+    Ok(())
+}
+
+/// [`check_client_min_schema`] against this contract's own storage schema version.
+pub fn require_client_schema(required_min_schema: u32) -> Result<(), ClientVersionError> {
+    check_client_min_schema(
+        required_min_schema,
+        crate::version_discovery::STORAGE_VERSION,
+    )
+}
+
+#[cfg(test)]
+mod client_schema_tests {
+    use super::*;
+    use crate::SLACalculatorContract;
+    use soroban_sdk::{symbol_short, testutils::Events as _, Env};
+
+    #[test]
+    fn a_client_requiring_a_newer_schema_is_rejected() {
+        assert_eq!(
+            check_client_min_schema(3, 2),
+            Err(ClientVersionError::SchemaTooNew {
+                required: 3,
+                supported: 2
+            })
+        );
+    }
+
+    #[test]
+    fn a_client_requiring_the_current_or_an_older_schema_is_accepted() {
+        assert_eq!(check_client_min_schema(2, 2), Ok(()));
+        assert_eq!(check_client_min_schema(1, 2), Ok(()));
+        assert_eq!(check_client_min_schema(0, 2), Ok(()));
+    }
+
+    #[test]
+    fn the_contract_check_uses_the_contracts_own_schema_version() {
+        let supported = crate::version_discovery::STORAGE_VERSION;
+        assert_eq!(require_client_schema(supported), Ok(()));
+        assert_eq!(
+            require_client_schema(supported + 1),
+            Err(ClientVersionError::SchemaTooNew {
+                required: supported + 1,
+                supported
+            })
+        );
+    }
+
+    #[test]
+    fn a_rejected_request_leaves_state_and_events_unchanged() {
+        let env = Env::default();
+        let id = env.register_contract(None, SLACalculatorContract);
+        env.as_contract(&id, || {
+            env.storage().instance().set(&symbol_short!("MARK"), &7u32);
+
+            let supported = crate::version_discovery::STORAGE_VERSION;
+            assert!(require_client_schema(supported + 1).is_err());
+
+            assert_eq!(env.storage().instance().get::<_, u32>(&symbol_short!("MARK")), Some(7));
+        });
+        assert_eq!(env.events().all().len(), 0);
+    }
+
+    #[test]
+    fn a_supported_client_passes_without_side_effects() {
+        let env = Env::default();
+        let id = env.register_contract(None, SLACalculatorContract);
+        env.as_contract(&id, || {
+            assert_eq!(require_client_schema(1), Ok(()));
+            assert!(!env.storage().instance().has(&symbol_short!("MARK")));
+        });
+        assert_eq!(env.events().all().len(), 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
