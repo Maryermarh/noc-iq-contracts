@@ -58,3 +58,45 @@ describe("SC-045 Authorization Matrix", () => {
     expect(privileged.length).toBeGreaterThan(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Parity with the SDK mock client (issue #1071): every method the matrix restricts must be
+// rejected by the mock for the same actors, with the stable `Unauthorized` code.
+// ---------------------------------------------------------------------------
+import { MockSlaCalculatorClient, PROTECTED_METHODS } from "../sdk/src/mock-client";
+
+describe("SC-045 matrix parity with the mock client", () => {
+  const identities: Record<string, string> = { admin: "GADMIN", operator: "GOPERATOR", stranger: "GSTRANGER" };
+
+  for (const entry of AUTH_MATRIX) {
+    if (!(entry.method in PROTECTED_METHODS)) continue;
+
+    for (const actor of entry.rejectedActors) {
+      it(`mock rejects ${actor} calling ${entry.method}`, async () => {
+        const mock = new MockSlaCalculatorClient();
+        mock.setRoles(identities.admin, identities.operator);
+
+        const result = await mock.invokeMethod(entry.method, [identities[actor]]);
+
+        expect(result.ok).toBe(false);
+        expect(result.errorCode).toBe("Unauthorized");
+      });
+    }
+
+    it(`mock allows the ${entry.requiredRole} to call ${entry.method}`, async () => {
+      const mock = new MockSlaCalculatorClient();
+      mock.setRoles(identities.admin, identities.operator);
+
+      const result = await mock.invokeMethod(entry.method, [identities[entry.requiredRole]]);
+
+      expect(result.ok).toBe(true);
+    });
+  }
+
+  it("every method the mock protects appears in the matrix with a matching role", () => {
+    for (const [method, role] of Object.entries(PROTECTED_METHODS)) {
+      const entry = AUTH_MATRIX.find((e) => e.method === method);
+      if (entry) expect(entry.requiredRole).toBe(role);
+    }
+  });
+});
