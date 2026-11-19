@@ -3,6 +3,9 @@ use soroban_sdk::{contracttype, symbol_short, Address, Env, String, Symbol};
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const PAUSE_INFO_KEY: Symbol = symbol_short!("PAUSEINF");
 const CONTRACT_PAUSED_EVENT: Symbol = symbol_short!("paused");
+/// Incident or root-cause reference of the pause currently in force, when it was a scoped pause.
+/// Kept apart from [`PauseInfo`] so the stored `PauseInfo` layout (and `get_pause_info`) is unchanged.
+pub(crate) const PAUSE_INCIDENT_KEY: Symbol = symbol_short!("PAUSEINC");
 
 #[contracttype]
 #[derive(Clone)]
@@ -22,8 +25,24 @@ pub fn pause(env: &Env, admin: &Address, reason: String) {
     };
     env.storage().instance().set(&PAUSED_KEY, &true);
     env.storage().instance().set(&PAUSE_INFO_KEY, &info);
+    // A plain pause supersedes any earlier scoped pause, so a stale reference cannot linger.
+    env.storage().instance().remove(&PAUSE_INCIDENT_KEY);
     env.events()
         .publish((CONTRACT_PAUSED_EVENT,), admin.clone());
+}
+
+/// Admin-only: pauses the contract and records the incident (or root-cause) reference that
+/// caused it. Only `unpause_for_incident` with the same reference clears a scoped pause without
+/// an explicit admin override; a newer pause with a different reference replaces this one.
+pub fn pause_with_incident(env: &Env, admin: &Address, reason: String, incident_ref: String) {
+    pause(env, admin, reason);
+    env.storage().instance().set(&PAUSE_INCIDENT_KEY, &incident_ref);
+}
+
+/// The incident reference of the pause currently in force, or `None` for an unscoped pause or
+/// when the contract is not paused.
+pub fn active_incident(env: &Env) -> Option<String> {
+    env.storage().instance().get(&PAUSE_INCIDENT_KEY)
 }
 
 /// View returning the metadata of the most recent pause action.
