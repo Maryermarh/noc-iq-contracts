@@ -52,6 +52,10 @@ jobs:
       - name: Check contract binary size
         run: |
           WASM=target/wasm32-unknown-unknown/release/sla_calculator.wasm
+          if [ ! -f "$WASM" ]; then
+            echo "::error::Missing artifact $WASM. Build it with: cargo build --release --manifest-path sla_calculator/Cargo.toml --target wasm32-unknown-unknown"
+            exit 1
+          fi
           SIZE=$(wc -c < "$WASM")
           echo "Contract size: ${SIZE} bytes"
           MAX=102400   # 100 KB soft limit

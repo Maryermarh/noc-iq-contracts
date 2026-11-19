@@ -72,3 +72,58 @@ describe("runSmokeVerification", () => {
     expect(statsCheck?.detail).toContain("RPC unreachable");
   });
 });
+
+describe("read-before-write ordering and write-probe gating", () => {
+  function probeClient(log: string[]): ContractClient {
+    const c = healthyClient();
+    const origPaused = c.isPaused.bind(c);
+    c.isPaused = async () => {
+      log.push("isPaused");
+      return origPaused();
+    };
+    c.writeProbe = async () => {
+      log.push("write");
+      return "probe ok";
+    };
+    return c;
+  }
+
+  it("does not run write probes unless opted in", async () => {
+    const log: string[] = [];
+    await runSmokeVerification(probeClient(log));
+    expect(log).not.toContain("write");
+  });
+
+  it("runs health first and the write probe last when opted in", async () => {
+    const log: string[] = [];
+    const results = await runSmokeVerification(probeClient(log), {
+      writeProbes: true,
+      network: "TESTNET",
+    });
+    expect(log[0]).toBe("isPaused");
+    expect(log[log.length - 1]).toBe("write");
+    expect(results[0].phase).toBe("read");
+    expect(results[results.length - 1].phase).toBe("write");
+  });
+
+  it("refuses write probes on mainnet by default", async () => {
+    const log: string[] = [];
+    const results = await runSmokeVerification(probeClient(log), {
+      writeProbes: true,
+      network: "MAINNET",
+    });
+    expect(log).not.toContain("write");
+    const last = results[results.length - 1];
+    expect(last.skipped).toBe(true);
+    expect(last.passed).toBe(false);
+  });
+
+  it("skips the write probe when a read check failed", async () => {
+    const log: string[] = [];
+    const c = probeClient(log);
+    c.isPaused = async () => true;
+    const results = await runSmokeVerification(c, { writeProbes: true, network: "TESTNET" });
+    expect(log).not.toContain("write");
+    expect(results[results.length - 1].skipped).toBe(true);
+  });
+});
