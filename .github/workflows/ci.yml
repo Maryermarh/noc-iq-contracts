@@ -83,6 +83,11 @@ jobs:
           fi
           echo "Generated bindings are current."
 
+      # #1042 — every exported contract method must be classified for the pause guard
+      - name: Verify the pause-guard inventory covers every contract entrypoint
+        working-directory: sdk
+        run: npx ts-node --transpile-only ../scripts/check-pause-guard-inventory.ts
+
   # #1092 — decide whether deployment helper scripts changed
   changes:
     name: Detect deployment script changes
