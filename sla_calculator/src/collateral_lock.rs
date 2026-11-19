@@ -38,6 +38,44 @@ pub enum LockError {
     NegativePenalty,
     PenaltyExceedsCoverage,
     PayoutExceedsLocked,
+    /// #1037 — a lock id was reused with a different amount.
+    DuplicateLockIdAmountMismatch,
+}
+
+/// #1037 — storage key for the original amount of each lock identifier.
+pub const LOCK_ID_KEY: Symbol = symbol_short!("LOCKID");
+
+/// Lock collateral under a stable identifier.
+///
+/// Reusing a lock id with the same amount is idempotent and returns the
+/// existing record; reusing it with a different amount is rejected before
+/// totals change.
+pub fn lock_collateral_with_id(
+    env: &Env,
+    provider: &Address,
+    lock_id: &Symbol,
+    amount: i128,
+    coverage_bps: u32,
+    locked_at: u64,
+) -> Result<LockRecord, LockError> {
+    let mut ids: Map<(Address, Symbol), i128> = env
+        .storage()
+        .persistent()
+        .get(&LOCK_ID_KEY)
+        .unwrap_or(Map::new(env));
+    let key = (provider.clone(), lock_id.clone());
+
+    if let Some(existing_amount) = ids.get(key.clone()) {
+        if existing_amount != amount {
+            return Err(LockError::DuplicateLockIdAmountMismatch);
+        }
+        return lock_record(env, provider).ok_or(LockError::NotLocked);
+    }
+
+    let record = lock_collateral(env, provider, amount, coverage_bps, locked_at)?;
+    ids.set(key, amount);
+    env.storage().persistent().set(&LOCK_ID_KEY, &ids);
+    Ok(record)
 }
 
 pub fn collateral_map(env: &Env) -> Map<Address, LockRecord> {
@@ -111,6 +149,28 @@ pub fn lock_collateral(
     env.events()
         .publish((LOCKED, provider.clone()), coverage_bps);
     Ok(record)
+}
+
+/// #1036 — release part of a locked bond, never allowing the remaining
+/// locked value to go negative or exceed the original bond.
+pub fn withdraw_partial_from_collateral(
+    env: &Env,
+    provider: &Address,
+    amount: i128,
+) -> Result<i128, LockError> {
+    let mut record = lock_record(env, provider).ok_or(LockError::NotLocked)?;
+    if amount == 0 {
+        return Err(LockError::ZeroAmount);
+    }
+    if amount < 0 {
+        return Err(LockError::NegativeAmount);
+    }
+    if amount > record.amount {
+        return Err(LockError::PayoutExceedsLocked);
+    }
+    record.amount -= amount;
+    store(env, provider, &record);
+    Ok(record.amount)
 }
 
 pub fn verify_coverage(env: &Env, provider: &Address, penalty: i128) -> Result<i128, LockError> {
@@ -502,6 +562,63 @@ mod tests {
             assert_eq!(listed.len(), 1);
             assert_eq!(listed.get(b.clone()), Some(600_000));
             assert_eq!(listed.get(a.clone()), None);
+        });
+    }
+}
+
+#[cfg(test)]
+mod lock_id_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn reusing_an_id_with_the_same_amount_is_idempotent() {
+        let env = Env::default();
+        let contract = env.register_contract(None, crate::SLACalculatorContract);
+        env.as_contract(&contract, || {
+            let provider = Address::generate(&env);
+            let id = Symbol::new(&env, "lock_1");
+            let first = lock_collateral_with_id(&env, &provider, &id, 1_000, 15_000, 100).unwrap();
+            let again = lock_collateral_with_id(&env, &provider, &id, 1_000, 15_000, 200).unwrap();
+
+            assert_eq!(again.amount, first.amount);
+            assert_eq!(total_locked(&env), 1_000);
+        });
+    }
+
+    #[test]
+    fn reusing_an_id_with_a_different_amount_is_rejected_without_changing_totals() {
+        let env = Env::default();
+        let contract = env.register_contract(None, crate::SLACalculatorContract);
+        env.as_contract(&contract, || {
+            let provider = Address::generate(&env);
+            let id = Symbol::new(&env, "lock_1");
+            lock_collateral_with_id(&env, &provider, &id, 1_000, 15_000, 100).unwrap();
+
+            assert_eq!(
+                lock_collateral_with_id(&env, &provider, &id, 2_000, 15_000, 100),
+                Err(LockError::DuplicateLockIdAmountMismatch)
+            );
+            assert_eq!(total_locked(&env), 1_000);
+        });
+    }
+
+    #[test]
+    fn repeated_partial_withdrawals_conserve_the_original_bond() {
+        let env = Env::default();
+        let contract = env.register_contract(None, crate::SLACalculatorContract);
+        env.as_contract(&contract, || {
+            let provider = Address::generate(&env);
+            lock_collateral(&env, &provider, 1_000, 15_000, 100).unwrap();
+
+            assert_eq!(withdraw_partial_from_collateral(&env, &provider, 300), Ok(700));
+            assert_eq!(withdraw_partial_from_collateral(&env, &provider, 300), Ok(400));
+            assert_eq!(withdraw_partial_from_collateral(&env, &provider, 400), Ok(0));
+            assert_eq!(
+                withdraw_partial_from_collateral(&env, &provider, 1),
+                Err(LockError::PayoutExceedsLocked)
+            );
+            assert_eq!(total_locked(&env), 0);
         });
     }
 }

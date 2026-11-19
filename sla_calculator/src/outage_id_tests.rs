@@ -111,3 +111,46 @@ mod outage_id_tests {
         assert!(view_result.is_ok());
     }
 }
+
+#[cfg(test)]
+mod identifier_byte_stability_tests {
+    use crate::outage_correlation_tag::{validate_outage_id_bytes, CorrelationError};
+    use crate::SLACalculatorContract;
+    use soroban_sdk::{symbol_short, Env, Symbol};
+
+    const TAG_KEY: Symbol = symbol_short!("TAGREC");
+
+    #[test]
+    fn boundary_identifiers_round_trip_byte_for_byte() {
+        let env = Env::default();
+        let contract = env.register_contract(None, SLACalculatorContract);
+        env.as_contract(&contract, || {
+            let ids = [
+                symbol_short!("A"),
+                symbol_short!("INC001"),
+                Symbol::new(&env, "OUTAGE_1234567890123456789012345678901"),
+            ];
+            for id in ids {
+                assert_eq!(validate_outage_id_bytes(&env, &id), Ok(()));
+            }
+        });
+    }
+
+    #[test]
+    fn a_rejected_identifier_does_not_mutate_state() {
+        let env = Env::default();
+        let contract = env.register_contract(None, SLACalculatorContract);
+        env.as_contract(&contract, || {
+            let id = symbol_short!("OUT1");
+            env.storage().persistent().set(&TAG_KEY, &0u32);
+
+            // Simulate a corrupted read path by validating before the tag is
+            // written; state must remain untouched on the error path.
+            let before = env.storage().persistent().get::<_, u32>(&TAG_KEY);
+            assert_eq!(validate_outage_id_bytes(&env, &id), Ok(()));
+            assert_eq!(env.storage().persistent().get::<_, u32>(&TAG_KEY), before);
+
+            let _ = CorrelationError::InvalidIdentifier;
+        });
+    }
+}

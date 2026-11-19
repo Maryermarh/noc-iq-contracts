@@ -98,6 +98,13 @@ pub fn integrity_check(env: &Env) -> IntegrityReport {
     }
 }
 
+/// #1037 — a duplicate lock identifier is only acceptable when the amount
+/// is identical to the original entry; a different amount would corrupt the
+/// accounting total.
+pub fn duplicate_lock_amount_allowed(existing_amount: i128, proposed_amount: i128) -> bool {
+    existing_amount == proposed_amount
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +299,20 @@ mod orphan_and_partial_failure_tests {
             assert_eq!(report.issues.get(0), Some(IntegrityIssue::MissingKey));
             assert_eq!(report.issues.get(1), Some(IntegrityIssue::OrphanedHistory));
         });
+    }
+}
+
+#[cfg(test)]
+mod lock_id_integrity_tests {
+    use super::*;
+
+    #[test]
+    fn same_amount_is_an_idempotent_duplicate() {
+        assert!(duplicate_lock_amount_allowed(1_000, 1_000));
+    }
+
+    #[test]
+    fn a_different_amount_is_rejected() {
+        assert!(!duplicate_lock_amount_allowed(1_000, 1_001));
     }
 }

@@ -138,6 +138,8 @@ pub const EVENT_OP_ACC: Symbol = symbol_short!("op_acc");
 pub const EVENT_OP_CAN: Symbol = symbol_short!("op_can");
 #[allow(dead_code)]
 pub const EVENT_SLA_VIOLATED: Symbol = symbol_short!("sla_viol"); // #594
+/// #1038 — emitted when an unbonding tranche receives a new amount.
+pub const EVENT_UNBONDING_UPDATED: Symbol = symbol_short!("unbnd_up");
 #[allow(dead_code)]
 pub const EVENT_SLA_MET: Symbol = symbol_short!("sla_met"); // #595
 
