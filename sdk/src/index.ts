@@ -29,7 +29,9 @@ export type {
   TransactionStatus,
   TransactionStatusResult,
 } from "./client";
-export { toScVal, fromScVal } from "./scval";
+export { toScVal, fromScVal, ScValRangeError } from "./scval";
+export { generateTypeDefinitions, MissingEventSchemaError } from "./typegen";
+export type { TypeGenSpec, TypeGenEvent } from "./typegen";
 export type { ScVal, ScValType } from "./scval";
 export {
   CANONICAL_SEVERITIES,
