@@ -13,10 +13,15 @@
  * by a codegen run.
  */
 
-import { writeFileSync } from "fs";
+import { readFileSync, writeFileSync } from "fs";
+import { join } from "path";
 import { generateTypeDefinitions, TypeGenSpec } from "../src/typegen";
+import { parseEventCatalog } from "../src/event-schema-doc";
 
-function loadPlaceholderSpec(): TypeGenSpec {
+/** The canonical on-chain event catalog; every documented event must have a TypeScript schema. */
+const EVENT_SCHEMA_PATH = join(__dirname, "..", "..", "sla_calculator", "src", "event_schema.rs");
+
+export function loadPlaceholderSpec(): TypeGenSpec {
   // Placeholder spec matching the SLA calculator's core functions. A full
   // implementation would parse this from the compiled WASM spec section
   // instead of being hand-written here.
@@ -51,12 +56,27 @@ function loadPlaceholderSpec(): TypeGenSpec {
   };
 }
 
+/**
+ * The full spec: the placeholder structs/functions plus the events documented in
+ * `event_schema.rs`. Every documented event is also listed as exported, so an event without a
+ * parsable payload fails generation by name (issue #1073).
+ */
+export function buildSpec(eventSchemaSource: string = readFileSync(EVENT_SCHEMA_PATH, "utf8")): TypeGenSpec {
+  const events = parseEventCatalog(eventSchemaSource);
+  return {
+    ...loadPlaceholderSpec(),
+    events,
+    exportedEvents: events.map((e) => e.name),
+  };
+}
+
 function main(): void {
   const outputPath = process.argv[2] ?? "src/generated-types.d.ts";
-  const spec = loadPlaceholderSpec();
-  const output = generateTypeDefinitions(spec);
+  const output = generateTypeDefinitions(buildSpec());
   writeFileSync(outputPath, output);
   console.log(`Wrote generated types to ${outputPath}`);
 }
 
-main();
+if (require.main === module) {
+  main();
+}

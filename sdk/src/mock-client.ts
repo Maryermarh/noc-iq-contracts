@@ -45,7 +45,8 @@ export class MockSlaCalculatorClient extends SLACalculatorClient {
 
   private readonly responses = new Map<string, MockResponse>();
 
-  constructor(config: ClientConfig = DEFAULT_MOCK_CONFIG) {
+  constructor(config: ClientConfig = { ...DEFAULT_MOCK_CONFIG }) {
+    // A fresh config object per instance (never the shared default), so no state is common to two mocks.
     super(config);
   }
 
@@ -54,7 +55,8 @@ export class MockSlaCalculatorClient extends SLACalculatorClient {
    * method name (e.g. "get_admin", "calculate_sla").
    */
   mockResponse<T>(method: string, response: MockResponse<T>): void {
-    this.responses.set(method, response as MockResponse);
+    // Copied so later changes to the caller's object cannot alter this instance's configured response.
+    this.responses.set(method, { ...(response as MockResponse) });
   }
 
   /** Clears all configured mock responses and recorded call history. */

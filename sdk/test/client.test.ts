@@ -247,3 +247,64 @@ describe("scval conversions", () => {
     });
   });
 });
+
+import { ScValRangeError } from "../src/scval";
+
+describe("ScVal integer range checks (issue #1074)", () => {
+  const U32_MAX = 4_294_967_295;
+  const I32_MIN = -2_147_483_648;
+  const U128_MAX = (1n << 128n) - 1n;
+  const I128_MIN = -(1n << 127n);
+
+  it("accepts the minimum and maximum of each supported type", () => {
+    expect(toScVal(0)).toEqual({ type: "u32", value: 0 });
+    expect(toScVal(U32_MAX)).toEqual({ type: "u32", value: U32_MAX });
+    expect(toScVal(I32_MIN)).toEqual({ type: "i32", value: I32_MIN });
+    expect(toScVal(U128_MAX)).toEqual({ type: "u128", value: U128_MAX });
+    expect(toScVal(I128_MIN)).toEqual({ type: "i128", value: I128_MIN });
+  });
+
+  it("rejects values one outside each boundary", () => {
+    expect(() => toScVal(U32_MAX + 1)).toThrow(ScValRangeError);
+    expect(() => toScVal(I32_MIN - 1)).toThrow(ScValRangeError);
+    expect(() => toScVal(U128_MAX + 1n)).toThrow(ScValRangeError);
+    expect(() => toScVal(I128_MIN - 1n)).toThrow(ScValRangeError);
+  });
+
+  it("rejects non-safe and non-finite numbers rather than truncating them", () => {
+    expect(() => toScVal(Number.MAX_SAFE_INTEGER * 2)).toThrow(ScValRangeError);
+    expect(() => toScVal(Number.POSITIVE_INFINITY)).toThrow();
+    expect(() => toScVal(Number.NaN)).toThrow();
+  });
+
+  it("names the field in the error, including nested array and object fields", () => {
+    expect(() => toScVal(U32_MAX + 1, "mttr_minutes")).toThrow(/mttr_minutes/);
+    expect(() => toScVal({ amount: U128_MAX + 1n }, "config")).toThrow(/config\.amount/);
+    expect(() => toScVal([1, 2, 99_999_999_999], "ids")).toThrow(/ids\[2\]/);
+  });
+
+  it("names the argument position when used as args.map(toScVal)", () => {
+    expect(() => [1, 2, U32_MAX + 1].map(toScVal)).toThrow(/arg\[2\]/);
+  });
+
+  it("exposes the field and value on the error and never returns a partial ScVal", () => {
+    let thrown: unknown;
+    let produced: unknown;
+    try {
+      produced = toScVal({ ok: 1, bad: U32_MAX + 1 }, "payload");
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(produced).toBeUndefined();
+    expect(thrown).toBeInstanceOf(ScValRangeError);
+    expect((thrown as ScValRangeError).field).toBe("payload.bad");
+    expect((thrown as ScValRangeError).value).toBe(U32_MAX + 1);
+  });
+
+  it("an out-of-range argument fails the client call before anything is sent", async () => {
+    await expect(new SLACalculatorClient({ contractId: "C", networkPassphrase: "t", rpcUrl: "x" }).getHistoryPage(0, U32_MAX + 1)).rejects.toThrow(
+      /arg\[1\]/,
+    );
+  });
+});
