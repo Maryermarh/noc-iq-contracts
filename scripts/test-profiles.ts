@@ -13,7 +13,7 @@
 
 import { execSync, ExecSyncOptions } from "child_process";
 
-interface TestProfile {
+export interface TestProfile {
   name: string;
   description: string;
   cargoFilter: string;       // passed to `cargo test <filter>`
@@ -22,7 +22,7 @@ interface TestProfile {
   wasmCheck: boolean;        // run cargo check --target wasm32-unknown-unknown
 }
 
-const PROFILES: Record<string, TestProfile> = {
+export const PROFILES: Record<string, TestProfile> = {
   fast: {
     name: "fast",
     description: "Core SLA logic only — fastest feedback loop (~5s)",
@@ -48,6 +48,59 @@ const PROFILES: Record<string, TestProfile> = {
     wasmCheck: true,
   },
 };
+
+export class UnknownProfileError extends Error {
+  constructor(public readonly requested: string, known: string[]) {
+    super(`Unknown profile "${requested}". Known profiles: ${known.join(", ")}`);
+    this.name = "UnknownProfileError";
+  }
+}
+
+export interface ProfileOutcome {
+  profile: string;
+  status: "passed" | "failed" | "skipped";
+  reason?: string;
+}
+
+/**
+ * Decides which profiles run and which are skipped (with a reason). A
+ * requested or skipped profile that does not exist throws instead of
+ * silently falling back to a default suite.
+ */
+export function selectProfiles(
+  requested: string[],
+  known: string[],
+  skip: Record<string, string> = {},
+): { run: string[]; skipped: ProfileOutcome[] } {
+  for (const name of [...requested, ...Object.keys(skip)]) {
+    if (!known.includes(name)) throw new UnknownProfileError(name, known);
+  }
+  const run: string[] = [];
+  const skipped: ProfileOutcome[] = [];
+  for (const name of known) {
+    if (skip[name] !== undefined) {
+      skipped.push({ profile: name, status: "skipped", reason: skip[name] || "skipped by request" });
+    } else if (requested.includes(name)) {
+      run.push(name);
+    } else {
+      skipped.push({ profile: name, status: "skipped", reason: "not requested" });
+    }
+  }
+  return { run, skipped };
+}
+
+export function formatSummary(outcomes: ProfileOutcome[]): string {
+  const lines = ["=== Test profile summary ==="];
+  for (const o of outcomes) {
+    const mark = o.status === "passed" ? "PASS" : o.status === "failed" ? "FAIL" : "SKIP";
+    lines.push(`  [${mark}] ${o.profile}${o.reason ? ` — ${o.reason}` : ""}`);
+  }
+  return lines.join("\n");
+}
+
+export function summaryJson(outcomes: ProfileOutcome[]): string {
+  return JSON.stringify({ profiles: outcomes }, null, 2) + "\n";
+}
 
 const opts: ExecSyncOptions = { stdio: "inherit", cwd: "sla_calculator" };
 
@@ -90,17 +143,56 @@ function printList(): void {
   console.log("\nUsage: npx ts-node scripts/test-profiles.ts <profile>");
 }
 
-const arg = process.argv[2];
+function main(argv: string[]): number {
+  if (!argv.length || argv.includes("--list") || argv.includes("--help")) {
+    printList();
+    return 0;
+  }
+  const known = Object.keys(PROFILES);
+  const requested: string[] = [];
+  const skip: Record<string, string> = {};
+  let jsonPath: string | undefined;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--json") jsonPath = argv[++i];
+    else if (a === "--skip") {
+      const [name, ...why] = (argv[++i] ?? "").split("=");
+      skip[name] = why.join("=");
+    } else requested.push(a);
+  }
 
-if (!arg || arg === "--list" || arg === "--help") {
-  printList();
-  process.exit(0);
+  let plan;
+  try {
+    plan = selectProfiles(requested, known, skip);
+  } catch (e) {
+    if (e instanceof UnknownProfileError) {
+      console.error(e.message);
+      return 1;
+    }
+    throw e;
+  }
+
+  const outcomes: ProfileOutcome[] = [];
+  for (const name of known) {
+    if (plan.run.includes(name)) {
+      try {
+        runProfile(PROFILES[name]);
+        outcomes.push({ profile: name, status: "passed" });
+      } catch (e: any) {
+        outcomes.push({ profile: name, status: "failed", reason: String(e?.message ?? e).split("\n")[0] });
+      }
+    } else {
+      outcomes.push(plan.skipped.find((s) => s.profile === name)!);
+    }
+  }
+  console.log("\n" + formatSummary(outcomes));
+  if (jsonPath) {
+    require("fs").writeFileSync(jsonPath, summaryJson(outcomes));
+    console.log(`Machine-readable summary written to ${jsonPath}`);
+  }
+  return outcomes.some((o) => o.status === "failed") ? 1 : 0;
 }
 
-const profile = PROFILES[arg];
-if (!profile) {
-  console.error(`Unknown profile "${arg}". Run with --list to see available profiles.`);
-  process.exit(1);
+if (require.main === module) {
+  process.exit(main(process.argv.slice(2)));
 }
-
-runProfile(profile);

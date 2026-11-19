@@ -23,6 +23,15 @@ cargo test --test integration -- migration_downgrade_guard
 cargo test --test integration -- migration_idempotent
 ```
 
+## Migration Dry Run
+
+`scripts/migration-dry-run.ts` validates, before anything is planned or applied,
+that the target schema version is reachable from the deployed version through
+the upgrade steps listed in `SUPPORTED_UPGRADES` (keep it in sync with
+`sla_calculator/src/storage_migration.rs`). Downgrades, versions newer than
+`CURRENT_STORAGE_VERSION`, and jumps with no supported path fail first. The
+report lists the exact source version, target version and upgrade path.
+
 ## Backward Compatibility Rules
 
 - Additive field additions to existing structs are backward compatible
