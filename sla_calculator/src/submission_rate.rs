@@ -261,6 +261,24 @@ pub fn record_submission(env: &Env, operator: &Address) {
     env.storage().instance().set(&symbol_short!("SGLOB"), &global_track);
 }
 
+/// Run `submission` under the rate limit, consuming quota only if it is accepted.
+///
+/// The limit is checked first (without recording anything). The closure then runs the
+/// authorization/validation/calculation; `record_submission` is called **only when it
+/// returns `Ok`**. A submission rejected before execution (bad authorization, invalid
+/// input, a paused contract) therefore leaves both the per-operator and the global
+/// counters unchanged, and a successful one consumes exactly one unit.
+pub fn with_submission_quota<T>(
+    env: &Env,
+    operator: &Address,
+    submission: impl FnOnce() -> Result<T, SLAError>,
+) -> Result<T, SLAError> {
+    check_submission_rate(env, operator)?;
+    let result = submission()?;
+    record_submission(env, operator);
+    Ok(result)
+}
+
 /// Get submission rate configuration.
 pub fn get_submission_rate_config(
     env: &Env,
@@ -451,6 +469,81 @@ mod tests {
         env.as_contract(&id, || {
             // Expired: reports the fresh window.
             assert_eq!(get_rate_window(&env), Ok((1_060, 1_120)));
+        });
+    }
+
+    #[test]
+    fn test_rejected_submission_does_not_consume_quota() {
+        let (env, id, admin) = setup();
+        let op = Address::generate(&env);
+        env.as_contract(&id, || {
+            set_submission_rate(&env, &admin, 2, 10, 60).unwrap();
+
+            // Rejected before execution (e.g. authorization or validation failure).
+            for _ in 0..5 {
+                let r: Result<(), SLAError> =
+                    with_submission_quota(&env, &op, || Err(SLAError::Unauthorized));
+                assert_eq!(r, Err(SLAError::Unauthorized));
+            }
+
+            assert_eq!(get_operator_submission_count(&env, &op), Ok(0));
+            assert_eq!(get_global_submission_count(&env), Ok(0));
+        });
+    }
+
+    #[test]
+    fn test_successful_submission_consumes_exactly_one_unit() {
+        let (env, id, admin) = setup();
+        let op = Address::generate(&env);
+        env.as_contract(&id, || {
+            set_submission_rate(&env, &admin, 5, 10, 60).unwrap();
+
+            assert_eq!(with_submission_quota(&env, &op, || Ok::<u32, SLAError>(7)), Ok(7));
+
+            assert_eq!(get_operator_submission_count(&env, &op), Ok(1));
+            assert_eq!(get_global_submission_count(&env), Ok(1));
+        });
+    }
+
+    #[test]
+    fn test_allowed_submission_succeeds_after_rejected_attempts_did_not_exhaust_window() {
+        let (env, id, admin) = setup();
+        let op = Address::generate(&env);
+        env.as_contract(&id, || {
+            // Allowance of exactly one accepted submission per window.
+            set_submission_rate(&env, &admin, 1, 10, 60).unwrap();
+
+            for _ in 0..3 {
+                let _ = with_submission_quota::<()>(&env, &op, || Err(SLAError::InvalidThreshold));
+            }
+
+            // The rejected attempts left the allowance intact, so this one is accepted...
+            assert_eq!(with_submission_quota(&env, &op, || Ok::<(), SLAError>(())), Ok(()));
+            // ...and now the allowance really is spent.
+            assert_eq!(
+                with_submission_quota(&env, &op, || Ok::<(), SLAError>(())),
+                Err(SLAError::ContractPaused)
+            );
+        });
+    }
+
+    #[test]
+    fn test_closure_is_not_run_when_the_limit_is_already_reached() {
+        let (env, id, admin) = setup();
+        let op = Address::generate(&env);
+        env.as_contract(&id, || {
+            set_submission_rate(&env, &admin, 1, 10, 60).unwrap();
+            record_submission(&env, &op);
+
+            let mut ran = false;
+            let r = with_submission_quota(&env, &op, || {
+                ran = true;
+                Ok::<(), SLAError>(())
+            });
+
+            assert_eq!(r, Err(SLAError::ContractPaused));
+            assert!(!ran);
+            assert_eq!(get_operator_submission_count(&env, &op), Ok(1));
         });
     }
 }

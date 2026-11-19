@@ -54,3 +54,81 @@ describe("MockSlaCalculatorClient", () => {
     expect(result.value).not.toBe("GADMIN123");
   });
 });
+
+import { PROTECTED_METHODS } from "../src/mock-client";
+import { SLACalculatorClient } from "../src/client";
+
+describe("MockSlaCalculatorClient authorization parity (issue #1071)", () => {
+  const ADMIN = "GADMIN";
+  const OPERATOR = "GOPERATOR";
+  const STRANGER = "GSTRANGER";
+
+  function configured() {
+    const client = new MockSlaCalculatorClient();
+    client.setRoles(ADMIN, OPERATOR);
+    return client;
+  }
+
+  it("lets the right role through and rejects every other caller, for each protected method", async () => {
+    for (const [method, role] of Object.entries(PROTECTED_METHODS)) {
+      const client = configured();
+      const authorized = role === "admin" ? ADMIN : OPERATOR;
+      const others = [role === "admin" ? OPERATOR : ADMIN, STRANGER];
+
+      expect((await client.invokeMethod(method, [authorized])).ok).toBe(true);
+      for (const caller of others) {
+        const result = await client.invokeMethod(method, [caller]);
+        expect({ method, caller, ok: result.ok, code: result.errorCode }).toEqual({
+          method,
+          caller,
+          ok: false,
+          code: "Unauthorized",
+        });
+      }
+    }
+  });
+
+  it("an unauthorized call fails with the stable Unauthorized code (contract error #3)", async () => {
+    const result = await configured().pause(STRANGER, "because");
+    expect(result).toMatchObject({ ok: false, errorCode: "Unauthorized", contractErrorCode: 3 });
+  });
+
+  it("the generated client reports the same error identifiers for the same contract failure", async () => {
+    const real = new SLACalculatorClient({
+      contractId: "C1",
+      networkPassphrase: "Test",
+      rpcUrl: "x",
+      transport: async () => ({ status: 200, error: "Error(Contract, #3)", contractErrorCode: 3 }),
+    });
+
+    const fromReal = await real.pause(STRANGER, "because");
+    const fromMock = await configured().pause(STRANGER, "because");
+
+    expect(fromMock.errorCode).toBe(fromReal.errorCode);
+    expect(fromMock.contractErrorCode).toBe(fromReal.contractErrorCode);
+    expect(fromMock.error).toBe(fromReal.error);
+  });
+
+  it("learns the roles from an initialize call and then enforces them", async () => {
+    const client = new MockSlaCalculatorClient();
+    await client.initialize(ADMIN, OPERATOR);
+
+    expect((await client.calculateSla(STRANGER, "o1", "high", 5)).ok).toBe(false);
+    expect((await client.calculateSla(OPERATOR, "o1", "high", 5)).ok).toBe(true);
+  });
+
+  it("does not enforce anything before roles are known (existing behaviour)", async () => {
+    const client = new MockSlaCalculatorClient();
+    expect((await client.pause("anyone", "r")).ok).toBe(true);
+  });
+
+  it("an unauthorized call does not reach a configured mock response", async () => {
+    const client = configured();
+    client.mockResponse("pause", { value: "ran" });
+
+    const result = await client.pause(STRANGER, "r");
+
+    expect(result.ok).toBe(false);
+    expect(result.value).toBeUndefined();
+  });
+});
