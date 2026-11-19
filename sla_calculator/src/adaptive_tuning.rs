@@ -8,6 +8,33 @@ use crate::{SLAError, SLAStats, ADMIN_KEY, STATS_KEY};
 const TUNING_KEY: Symbol = symbol_short!("TUNE");
 
 // -----------------------------------------------------------------------
+// #820 — bounds for the computed adjustment factor
+// -----------------------------------------------------------------------
+/// Documented lower bound of the adaptive adjustment factor, in basis points.
+pub const MIN_ADJUSTMENT_FACTOR_BPS: i32 = -5_000;
+/// Documented upper bound of the adaptive adjustment factor, in basis points.
+pub const MAX_ADJUSTMENT_FACTOR_BPS: i32 = 5_000;
+
+/// Clamp a computed adjustment factor into the documented, reviewable range.
+pub fn clamp_adjustment_factor(factor: i32) -> i32 {
+    factor.clamp(MIN_ADJUSTMENT_FACTOR_BPS, MAX_ADJUSTMENT_FACTOR_BPS)
+}
+
+/// Reject tuning configuration that could produce an unbounded adjustment.
+pub fn validate_tuning_config(config: &TuningConfig) -> Result<(), SLAError> {
+    if config.target_compliance_bps > 10_000 {
+        return Err(SLAError::InvalidThreshold);
+    }
+    if config.adjustment_step_bps == 0 || config.adjustment_step_bps > config.max_adjustment_bps {
+        return Err(SLAError::InvalidThreshold);
+    }
+    if (config.max_adjustment_bps as i32) > MAX_ADJUSTMENT_FACTOR_BPS {
+        return Err(SLAError::InvalidThreshold);
+    }
+    Ok(())
+}
+
+// -----------------------------------------------------------------------
 // Events
 // -----------------------------------------------------------------------
 const EVENT_TUNE_SET: Symbol = symbol_short!("tune_set");
@@ -79,20 +106,16 @@ pub fn set_tuning(
 ) -> Result<(), SLAError> {
     require_admin(env, caller)?;
 
-    if target_compliance_bps > 10000 {
-        return Err(SLAError::InvalidThreshold);
-    }
+    let config = TuningConfig {
+        target_compliance_bps,
+        adjustment_step_bps,
+        max_adjustment_bps,
+        evaluation_window,
+        enabled: true,
+    };
+    validate_tuning_config(&config)?;
 
-    env.storage().instance().set(
-        &TUNING_KEY,
-        &TuningConfig {
-            target_compliance_bps,
-            adjustment_step_bps,
-            max_adjustment_bps,
-            evaluation_window,
-            enabled: true,
-        },
-    );
+    env.storage().instance().set(&TUNING_KEY, &config);
 
     env.events().publish(
         (EVENT_TUNE_SET, EVENT_VERSION, caller),
@@ -175,11 +198,13 @@ pub fn get_tuning_recommendation(env: &Env) -> Result<TuningRecommendation, SLAE
             penalty_adjustment = config.adjustment_step_bps as i32;
         }
 
-        // Cap adjustments
-        threshold_adjustment = threshold_adjustment
+        // #820 — cap adjustments to the configured bound and then to the
+        // documented absolute factor range, so extreme history can never
+        // push a recommendation outside a sane, reviewable interval.
+        threshold_adjustment = clamp_adjustment_factor(threshold_adjustment)
             .max(-(config.max_adjustment_bps as i32))
             .min(config.max_adjustment_bps as i32);
-        penalty_adjustment = penalty_adjustment
+        penalty_adjustment = clamp_adjustment_factor(penalty_adjustment)
             .max(-(config.max_adjustment_bps as i32))
             .min(config.max_adjustment_bps as i32);
     }
@@ -233,4 +258,42 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), SLAError> {
         return Err(SLAError::Unauthorized);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod adjustment_factor_tests {
+    use super::*;
+
+    fn config(step: u32, max: u32) -> TuningConfig {
+        TuningConfig {
+            target_compliance_bps: 9_500,
+            adjustment_step_bps: step,
+            max_adjustment_bps: max,
+            evaluation_window: 86_400,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn extreme_factors_are_clamped_to_the_documented_range() {
+        assert_eq!(clamp_adjustment_factor(i32::MAX), MAX_ADJUSTMENT_FACTOR_BPS);
+        assert_eq!(clamp_adjustment_factor(i32::MIN), MIN_ADJUSTMENT_FACTOR_BPS);
+        assert_eq!(clamp_adjustment_factor(0), 0);
+        assert_eq!(clamp_adjustment_factor(250), 250);
+    }
+
+    #[test]
+    fn configuration_with_inverted_bounds_is_rejected() {
+        assert_eq!(validate_tuning_config(&config(600, 500)), Err(SLAError::InvalidThreshold));
+        assert_eq!(validate_tuning_config(&config(0, 500)), Err(SLAError::InvalidThreshold));
+    }
+
+    #[test]
+    fn configuration_outside_the_factor_range_is_rejected() {
+        assert_eq!(
+            validate_tuning_config(&config(100, MAX_ADJUSTMENT_FACTOR_BPS as u32 + 1)),
+            Err(SLAError::InvalidThreshold)
+        );
+        assert_eq!(validate_tuning_config(&config(100, 500)), Ok(()));
+    }
 }
