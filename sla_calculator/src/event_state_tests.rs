@@ -564,3 +564,47 @@ mod event_state_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod mutation_then_event_tests {
+    use crate::event_schema::{emit_success_after_commit, EVENT_SLA_CALC};
+    use crate::{SLACalculatorContract, SLAError};
+    use soroban_sdk::{symbol_short, testutils::Events as _, Env, Symbol};
+
+    #[test]
+    fn a_failed_mutation_leaves_no_success_event() {
+        let env = Env::default();
+        let contract = env.register_contract(None, SLACalculatorContract);
+        env.as_contract(&contract, || {
+            let result = emit_success_after_commit(
+                &env,
+                EVENT_SLA_CALC,
+                symbol_short!("OUT1"),
+                || Err::<(), SLAError>(SLAError::InvalidThreshold),
+            );
+            assert_eq!(result, Err(SLAError::InvalidThreshold));
+            assert_eq!(env.events().all().len(), 0);
+        });
+    }
+
+    #[test]
+    fn a_successful_operation_emits_exactly_one_event_after_the_write() {
+        let env = Env::default();
+        let contract = env.register_contract(None, SLACalculatorContract);
+        env.as_contract(&contract, || {
+            let key = Symbol::new(&env, "STATE");
+            let result = emit_success_after_commit(
+                &env,
+                EVENT_SLA_CALC,
+                symbol_short!("OUT1"),
+                || {
+                    env.storage().instance().set(&key, &99u32);
+                    Ok(())
+                },
+            );
+            assert_eq!(result, Ok(()));
+            assert_eq!(env.storage().instance().get::<_, u32>(&key), Some(99));
+            assert_eq!(env.events().all().len(), 1);
+        });
+    }
+}

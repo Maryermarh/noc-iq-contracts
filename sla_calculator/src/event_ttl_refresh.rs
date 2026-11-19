@@ -30,6 +30,35 @@ pub fn refresh_outage_index_ttl(env: &Env, key: &Symbol) -> bool {
     true
 }
 
+/// #1029 — an entry with no remaining lifetime is expired.
+pub fn is_expired(remaining_ledgers: u32) -> bool {
+    remaining_ledgers == 0
+}
+
+/// #1029 — refresh only records that are still live.
+///
+/// Reading an expired record must not resurrect it or make stale history look
+/// active again: a zero remaining TTL returns `false` without extending.
+pub fn refresh_outage_index_ttl_if_live(env: &Env, key: &Symbol) -> bool {
+    if !env.storage().persistent().has(key) {
+        return false;
+    }
+    let current = env.storage().persistent().get_ttl(key);
+    if is_expired(current) {
+        return false;
+    }
+    let target = guarded_extend_to(current, TTL_EXTEND_TO_LEDGERS);
+    env.storage()
+        .persistent()
+        .extend_ttl(key, TTL_THRESHOLD_LEDGERS, target);
+    true
+}
+
+/// Read an event record without touching its TTL.
+pub fn read_event_record(env: &Env, key: &Symbol) -> Option<u32> {
+    env.storage().persistent().get(key)
+}
+
 pub fn refresh_many(env: &Env, keys: &Vec<Symbol>) -> u32 {
     let mut refreshed = 0u32;
     for key in keys.iter() {
@@ -167,6 +196,45 @@ mod tests {
             refresh_outage_index_ttl(&env, &key);
             let after = env.storage().persistent().get_ttl(&key);
             assert!(after >= before);
+        });
+    }
+}
+
+#[cfg(test)]
+mod expired_read_tests {
+    use super::*;
+    use crate::SLACalculatorContract;
+    use soroban_sdk::testutils::{storage::Persistent as _, Ledger as _};
+
+    #[test]
+    fn zero_remaining_ledgers_is_expired() {
+        assert!(is_expired(0));
+        assert!(!is_expired(1));
+        assert!(!is_expired(TTL_THRESHOLD_LEDGERS));
+    }
+
+    #[test]
+    fn reading_an_absent_record_does_not_revive_it() {
+        let env = Env::default();
+        let contract = env.register_contract(None, SLACalculatorContract);
+        env.as_contract(&contract, || {
+            let absent = Symbol::new(&env, "OUT404");
+            assert_eq!(read_event_record(&env, &absent), None);
+            assert!(!refresh_outage_index_ttl_if_live(&env, &absent));
+            assert!(!env.storage().persistent().has(&absent));
+        });
+    }
+
+    #[test]
+    fn a_live_record_is_refreshed_to_the_retention_target() {
+        let env = Env::default();
+        let contract = env.register_contract(None, SLACalculatorContract);
+        env.as_contract(&contract, || {
+            let key = Symbol::new(&env, "OUT1");
+            env.storage().persistent().set(&key, &42u32);
+            assert_eq!(read_event_record(&env, &key), Some(42));
+            assert!(refresh_outage_index_ttl_if_live(&env, &key));
+            assert!(env.storage().persistent().get_ttl(&key) >= TTL_EXTEND_TO_LEDGERS);
         });
     }
 }
