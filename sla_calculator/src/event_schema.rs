@@ -217,6 +217,29 @@ pub fn ingest_outage_event(env: &Env, event: &OutageEvent) -> Result<(), SLAErro
     Ok(())
 }
 
+// -----------------------------------------------------------------------
+// #1027 — serialized payload size guard
+// -----------------------------------------------------------------------
+
+/// Maximum serialized size, in bytes, of a single event payload.
+pub const MAX_SERIALIZED_EVENT_PAYLOAD_BYTES: u32 = 200;
+
+/// Reason a serialized event payload size was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadSizeError {
+    TooLarge,
+}
+
+/// Validate a serialized payload size before the state transition that would
+/// emit the event is committed. A payload exactly on the limit is accepted;
+/// one byte over is rejected.
+pub fn validate_serialized_payload_size(size: u32) -> Result<(), PayloadSizeError> {
+    if size > MAX_SERIALIZED_EVENT_PAYLOAD_BYTES {
+        return Err(PayloadSizeError::TooLarge);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     extern crate alloc;

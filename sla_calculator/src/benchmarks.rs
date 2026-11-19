@@ -222,3 +222,103 @@ fn bench_get_version_info() {
         let _ = client.get_migration_state();
     }
 }
+
+// -----------------------------------------------------------------------
+// #1024 — separate cold and warm storage cost baselines
+// -----------------------------------------------------------------------
+
+/// Storage costs split into first-write (cold) and steady-state (warm) paths.
+///
+/// Keeping these separate makes a change to the storage layout reviewable:
+/// a cold-write regression is not hidden by fast warm reads in an average.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageCostBaseline {
+    /// Cost of the first write to a key (cold path).
+    pub cold_write: u64,
+    /// Cost of re-writing an existing key (warm path).
+    pub warm_write: u64,
+    /// Cost of reading an existing key (warm path).
+    pub warm_read: u64,
+}
+
+/// Render a baseline with explicit cold/warm labels for the report.
+pub fn format_storage_baseline(label: &str, baseline: &StorageCostBaseline) -> String {
+    std::format!(
+        "{label}: cold_write={}, warm_write={}, warm_read={}",
+        baseline.cold_write,
+        baseline.warm_write,
+        baseline.warm_read
+    )
+}
+
+/// Compare a measured baseline against its budget. Either path exceeding its
+/// budget produces a message that names the path and both values.
+pub fn compare_storage_baseline(
+    measured: &StorageCostBaseline,
+    budget: &StorageCostBaseline,
+) -> Result<(), String> {
+    if measured.cold_write > budget.cold_write {
+        return Err(std::format!(
+            "cold write path regressed: {} > budget {}",
+            measured.cold_write,
+            budget.cold_write
+        ));
+    }
+    if measured.warm_write > budget.warm_write {
+        return Err(std::format!(
+            "warm write path regressed: {} > budget {}",
+            measured.warm_write,
+            budget.warm_write
+        ));
+    }
+    if measured.warm_read > budget.warm_read {
+        return Err(std::format!(
+            "warm read path regressed: {} > budget {}",
+            measured.warm_read,
+            budget.warm_read
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod cold_warm_baseline_tests {
+    use super::*;
+
+    fn budget() -> StorageCostBaseline {
+        StorageCostBaseline {
+            cold_write: 1_000,
+            warm_write: 400,
+            warm_read: 100,
+        }
+    }
+
+    #[test]
+    fn the_report_labels_cold_and_warm_paths_separately() {
+        let report = format_storage_baseline("SLA calc", &budget());
+        assert!(report.contains("cold_write=1000"));
+        assert!(report.contains("warm_write=400"));
+        assert!(report.contains("warm_read=100"));
+    }
+
+    #[test]
+    fn a_cold_write_regression_names_the_cold_path() {
+        let mut measured = budget();
+        measured.cold_write += 1;
+        let error = compare_storage_baseline(&measured, &budget()).unwrap_err();
+        assert!(error.contains("cold write path"), "{error}");
+    }
+
+    #[test]
+    fn a_warm_path_regression_names_the_warm_path() {
+        let mut measured = budget();
+        measured.warm_read += 1;
+        let error = compare_storage_baseline(&measured, &budget()).unwrap_err();
+        assert!(error.contains("warm read path"), "{error}");
+    }
+
+    #[test]
+    fn a_baseline_within_budget_passes() {
+        assert_eq!(compare_storage_baseline(&budget(), &budget()), Ok(()));
+    }
+}
