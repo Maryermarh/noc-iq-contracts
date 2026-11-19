@@ -340,3 +340,18 @@ mod orphan_and_partial_failure_tests {
         });
     }
 }
+
+#[cfg(test)]
+mod lock_id_integrity_tests {
+    use super::*;
+
+    #[test]
+    fn same_amount_is_an_idempotent_duplicate() {
+        assert!(duplicate_lock_amount_allowed(1_000, 1_000));
+    }
+
+    #[test]
+    fn a_different_amount_is_rejected() {
+        assert!(!duplicate_lock_amount_allowed(1_000, 1_001));
+    }
+}

@@ -15,6 +15,30 @@ pub struct OutageTag {
 pub enum CorrelationError {
     SelfParent,
     CycleDetected,
+    /// #1039 — identifier did not survive an encode/write/read round trip.
+    InvalidIdentifier,
+}
+
+const IDENTIFIER_ROUNDTRIP_KEY: Symbol = symbol_short!("IDROUND");
+
+/// #1039 — validate that an accepted outage identifier is encoded
+/// byte-for-byte identically in storage and in the event payload.
+///
+/// Validation happens before the caller mutates any correlation state, so an
+/// invalid encoding cannot leave a half-written tag or event behind.
+pub fn validate_outage_id_bytes(env: &Env, outage_id: &Symbol) -> Result<(), CorrelationError> {
+    env.storage()
+        .instance()
+        .set(&IDENTIFIER_ROUNDTRIP_KEY, outage_id);
+    let restored: Option<Symbol> = env.storage().instance().get(&IDENTIFIER_ROUNDTRIP_KEY);
+    env.storage()
+        .instance()
+        .remove(&IDENTIFIER_ROUNDTRIP_KEY);
+
+    match restored {
+        Some(value) if value == *outage_id => Ok(()),
+        _ => Err(CorrelationError::InvalidIdentifier),
+    }
 }
 
 pub fn validate_parent(
