@@ -19,6 +19,7 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import { execSync } from "child_process";
+import { verifyWasmAgainstManifest } from "../offchain/releaseManifest";
 import {
   buildReleaseMetadata,
   serializeReleaseMetadata,
@@ -51,6 +52,36 @@ function getGitTag(): string {
   } catch {
     return getGitSha();
   }
+}
+
+/**
+ * #1051: when a release manifest is present (`--manifest <file>`, or `manifest.sha256` in the
+ * working directory), its digest must equal the digest of the WASM being packaged. A mismatch
+ * aborts before any evidence is generated.
+ */
+function manifestPath(): string | undefined {
+  const idx = process.argv.indexOf("--manifest");
+  if (idx !== -1 && idx + 1 < process.argv.length) return path.resolve(process.argv[idx + 1]);
+  const fallback = path.resolve("manifest.sha256");
+  return fs.existsSync(fallback) ? fallback : undefined;
+}
+
+function verifyManifestOrAbort(wasmPath: string): void {
+  const manifest = manifestPath();
+  if (manifest === undefined) {
+    console.log("ℹ️  No release manifest given or found — skipping manifest hash check");
+    return;
+  }
+  if (!fs.existsSync(manifest)) {
+    console.error(`❌ Release manifest ${manifest} does not exist. Aborting.`);
+    process.exit(1);
+  }
+  const result = verifyWasmAgainstManifest(fs.readFileSync(manifest, "utf8"), fs.readFileSync(wasmPath));
+  if (!result.ok) {
+    console.error(`❌ ${result.message}. Aborting before generating release evidence.`);
+    process.exit(1);
+  }
+  console.log(`✅ ${result.message}`);
 }
 
 function sha256(filePath: string): string {
@@ -92,6 +123,9 @@ function buildEvidencePackage(): void {
     console.error("❌ WASM binary not found after build. Aborting.");
     process.exit(1);
   }
+
+  // 1b. The manifest and the WASM must name the same digest before anything is packaged
+  verifyManifestOrAbort(WASM_PATH);
 
   // 2. Prepare output directory
   const evidenceDir = path.join(OUTPUT_DIR, `evidence-${tag}-${sha}`);

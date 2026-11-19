@@ -117,3 +117,78 @@ scans, and deployment verification.
 - **Release or deployment issue** → `tooling/` or `scripts/`
 - **Documentation gap** → `docs/`
 - **New contributor** → read `docs/contributor-verification-guide.md` first
+
+---
+
+## Contract Entrypoint Map
+
+Every method exported by the `#[contractimpl]` block of `sla_calculator/src/lib.rs`, with where it
+lives and who may call it. `scripts/check-module-map.ts` (run in CI) compares this table with
+`lib.rs` and fails on a missing or stale method, so **add a row here in the same change that
+exports a new method**. Only the first column (the backticked method name) is machine-checked.
+
+| Method | Implementation | Access | Notes |
+|--------|----------------|--------|-------|
+| `initialize` | lib.rs | Anyone, once only (`AlreadyInitialized` afterwards) | Sets admin, operator and defaults |
+| `migrate` | lib.rs | Admin (checked against the stored admin; usable before the version stamp exists) | Idempotent v0 to current step |
+| `get_admin` | lib.rs | Public read |  |
+| `get_operator` | lib.rs | Public read |  |
+| `verify_admin_auth` | lib.rs | Admin (`require_auth` plus role check) | Authorization primitive |
+| `set_operator` | lib.rs | Admin | Emits `op_set` and the role audit event |
+| `revoke_operator` | lib.rs | Admin |  |
+| `renounce_operator` | lib.rs | Operator |  |
+| `propose_admin` | lib.rs | Admin | Two-step transfer, step 1 |
+| `accept_admin` | lib.rs | Pending admin | Two-step transfer, step 2; proposals expire |
+| `cancel_admin_proposal` | lib.rs | Admin |  |
+| `get_pending_admin` | lib.rs | Public read | Drops an expired proposal as a side effect |
+| `get_pending_operator` | lib.rs | Public read | Drops an expired proposal as a side effect |
+| `propose_operator` | lib.rs | Admin | Two-step operator change, step 1 |
+| `accept_operator` | lib.rs | Pending operator | Two-step operator change, step 2 |
+| `cancel_operator_proposal` | lib.rs | Admin |  |
+| `renounce_admin` | lib.rs | Admin | Irreversible |
+| `pause` | lib.rs | Admin | Blocks `calculate_sla`; see `pause_action.rs` |
+| `unpause` | lib.rs | Admin | See `unpause.rs` |
+| `is_paused` | lib.rs | Public read |  |
+| `get_pause_info` | lib.rs | Public read |  |
+| `set_config` | lib.rs | Admin | Validated against the bounds modules |
+| `get_config_update_count` | lib.rs | Public read |  |
+| `threshold_to_seconds` | lib.rs | Public (pure helper) |  |
+| `export_config_map` | lib.rs | Public read |  |
+| `import_config_map` | lib.rs | Admin |  |
+| `get_config` | lib.rs | Public read |  |
+| `list_configs` | lib.rs | Public read |  |
+| `get_config_snapshot` | lib.rs | Public read |  |
+| `reset_config_to_defaults` | lib.rs | Admin |  |
+| `get_config_version_hash` | lib.rs | Public read |  |
+| `compute_result_hash` | lib.rs | Public (pure) |  |
+| `get_failure_schema` | lib.rs | Public read |  |
+| `get_result_schema` | lib.rs | Public read |  |
+| `get_contract_metadata` | lib.rs | Public read |  |
+| `get_stats` | lib.rs | Public read |  |
+| `simulate_sla` | lib.rs | Public (read-only simulation) |  |
+| `calculate_sla_view` | lib.rs | Public (read-only) |  |
+| `calculate_monthly_sla_compliance` | lib.rs | Public (read-only) |  |
+| `batch_calculate_view` | lib.rs | Public (read-only) |  |
+| `batch_calculate` | lib.rs (delegates to `batch.rs`) | Operator | Writes history like `calculate_sla` |
+| `get_batch_downtime` | lib.rs | Public (read-only) | Up to 50 site IDs |
+| `calculate_sla` | lib.rs | Operator (and not paused) | Writes history, stats and events |
+| `get_initialization_status` | lib.rs | Public read |  |
+| `get_history_summary` | lib.rs | Public read |  |
+| `get_history` | lib.rs | Public read |  |
+| `prune_history` | lib.rs | Admin |  |
+| `prune_history_by_age` | lib.rs | Admin |  |
+| `get_history_page` | lib.rs | Public read |  |
+| `get_history_by_outage` | lib.rs | Public read |  |
+| `get_latest_by_outage` | lib.rs | Public read |  |
+| `get_config_count` | lib.rs | Public read |  |
+| `get_storage_version` | lib.rs | Public read |  |
+| `set_retention_limit` | lib.rs | Admin |  |
+| `get_retention_limit` | lib.rs | Public read |  |
+| `set_max_outage_duration` | lib.rs | Admin |  |
+| `get_max_outage_duration` | lib.rs | Public read |  |
+| `get_migration_state` | lib.rs | Public read |  |
+| `get_version_info` | lib.rs | Public read | See `version_negotiation.rs` |
+| `set_migration_key` | lib.rs | Admin | Starts the time-locked migration |
+| `execute_migration` | lib.rs | Migration key holder | Time-locked |
+| `prune_history_queue` | lib.rs | Admin |  |
+
